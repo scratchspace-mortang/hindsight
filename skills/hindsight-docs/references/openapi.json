@@ -10156,7 +10156,7 @@
               }
             ],
             "title": "Last Memory Write At",
-            "description": "When a memory was last written in this bank \u2014 stored, edited, or consolidated (ISO format). Null if the bank has no memories. A mental model whose `last_memory_seen_at` is at or after this is up to date whatever its tags; an older one may need a refresh, which only the single mental-model read can confirm."
+            "description": "When a memory was last written in this bank \u2014 stored, edited, or consolidated (ISO format). Null if the bank has no memories. A mental model whose `last_memory_seen_at` is at or after this is up to date whatever its tags, in tagscope mode \u2014 with one exception: it cites a memory that has since been deleted, which raises no write and marks it stale anyway (see `is_stale`). An older one may need a refresh, which only the single mental-model read can confirm. In graph mode staleness follows the provenance baseline instead of the scope, so `is_stale` decides."
           },
           "pending_consolidation": {
             "type": "integer",
@@ -16679,7 +16679,7 @@
               }
             ],
             "title": "Last Memory Seen At",
-            "description": "How far through the bank's memories this model is written \u2014 the newest in-scope memory the last refresh saw, in ISO format. Stands still when nothing in the model's scope has been written, however often it is refreshed. At or after the bank's `last_memory_write_at` (GET /stats) the model is provably up to date; when it is older, `is_stale` settles it against the model's own scope. Null for a model no refresh has stamped yet."
+            "description": "How far through the bank's memories this model is written \u2014 the newest in-scope memory the last refresh saw, in ISO format. Stands still when nothing in the model's scope has been written, however often it is refreshed. At or after the bank's `last_memory_write_at` (GET /stats) the model is up to date in tagscope mode \u2014 with one exception: it cites a memory that has since been deleted, which raises no write and marks it stale anyway (see `is_stale`); in graph mode staleness follows the provenance baseline instead of the scope, so `is_stale` decides. When it is older, `is_stale` settles it against the model's own scope. Null for a model no refresh has stamped yet."
           },
           "last_refresh_failed_at": {
             "anyOf": [
@@ -16764,7 +16764,7 @@
               }
             ],
             "title": "Is Stale",
-            "description": "True when memories matching this mental model's tag/fact_type scope have been written since last_memory_seen_at \u2014 the same check that decides whether a scheduled refresh does any work, so a model flagged here is one a refresh would actually rewrite. Populated on both the single read and the list. Deletions are not observed: removing an in-scope memory leaves no write behind, so it does not raise this flag."
+            "description": "True when memories matching this mental model's tag/fact_type scope have been written since last_memory_seen_at \u2014 the same check that decides whether a scheduled refresh does any work, so a model flagged here is one a refresh would actually rewrite. Populated on both the single read and the list. Deleting a memory this model was built from also raises this flag in both modes (removing a cited memory leaves no write behind, so it is asked separately); in graph mode a change to a provenance memory raises it too. In graph mode the rule is the provenance baseline instead of the scope: a brand-new memory outside every provenance observation never raises this flag. Deleting a memory the model never cited or read does not."
           }
         },
         "type": "object",
@@ -16932,6 +16932,26 @@
             "description": "Refresh mode. 'full' (default) regenerates the mental model content from scratch on each refresh. 'delta' performs surgical edits against the existing content: unchanged sections are preserved byte-for-byte, stale content is removed, new content is added. If the mental model has no existing content, or if the source_query has changed since the last refresh, delta mode falls back to a full regeneration automatically.",
             "default": "full"
           },
+          "staleness_check": {
+            "type": "string",
+            "enum": [
+              "tagscope",
+              "graph"
+            ],
+            "title": "Staleness Check",
+            "description": "How this model's staleness is decided. 'tagscope' (default) uses the scope-plus-watermark check; 'graph' uses provenance (the memories the model was built from). When the field is absent it reads back as 'tagscope'. Graph mode is PostgreSQL-only: on a non-Postgres (Oracle) backend there is no change-record table, so a graph-mode model is answered by the tagscope rule there.",
+            "default": "tagscope"
+          },
+          "graph_stale": {
+            "type": "string",
+            "enum": [
+              "cited_memories",
+              "read_memories"
+            ],
+            "title": "Graph Stale",
+            "description": "Which provenance marks the model stale in graph mode: 'cited_memories' (default) or 'read_memories'. Only meaningful when staleness_check is 'graph'. When the field is absent it reads back as 'cited_memories'.",
+            "default": "cited_memories"
+          },
           "refresh_after_consolidation": {
             "type": "boolean",
             "title": "Refresh After Consolidation",
@@ -16948,7 +16968,7 @@
               }
             ],
             "title": "Refresh Cron",
-            "description": "Cron expression (UTC, standard 5-field syntax, e.g. '0 3 * * *' for daily at 03:00 UTC) for refreshing this mental model on a fixed schedule. Mutually exclusive with refresh_after_consolidation \u2014 a model refreshes either after consolidation or on a cron schedule, not both. A scheduled refresh only runs when the model is stale (new memories in its scope since the last refresh); if nothing changed, the tick is skipped to avoid a wasted LLM call. null = no schedule."
+            "description": "Cron expression (UTC, standard 5-field syntax, e.g. '0 3 * * *' for daily at 03:00 UTC) for refreshing this mental model on a fixed schedule. Mutually exclusive with refresh_after_consolidation \u2014 a model refreshes either after consolidation or on a cron schedule, not both. A scheduled refresh only runs when the model is stale (new memories in its scope since the last refresh); if nothing changed, the tick is skipped to avoid a wasted LLM call. In graph mode staleness means a durable change to a provenance memory, not a scope write, so a brand-new memory outside provenance never triggers this schedule. null = no schedule."
           },
           "full_refresh_cron": {
             "anyOf": [
@@ -17171,6 +17191,26 @@
             "description": "Refresh mode. 'full' (default) regenerates the mental model content from scratch on each refresh. 'delta' performs surgical edits against the existing content: unchanged sections are preserved byte-for-byte, stale content is removed, new content is added. If the mental model has no existing content, or if the source_query has changed since the last refresh, delta mode falls back to a full regeneration automatically.",
             "default": "full"
           },
+          "staleness_check": {
+            "type": "string",
+            "enum": [
+              "tagscope",
+              "graph"
+            ],
+            "title": "Staleness Check",
+            "description": "How this model's staleness is decided. 'tagscope' (default) uses the scope-plus-watermark check; 'graph' uses provenance (the memories the model was built from). When the field is absent it reads back as 'tagscope'. Graph mode is PostgreSQL-only: on a non-Postgres (Oracle) backend there is no change-record table, so a graph-mode model is answered by the tagscope rule there.",
+            "default": "tagscope"
+          },
+          "graph_stale": {
+            "type": "string",
+            "enum": [
+              "cited_memories",
+              "read_memories"
+            ],
+            "title": "Graph Stale",
+            "description": "Which provenance marks the model stale in graph mode: 'cited_memories' (default) or 'read_memories'. Only meaningful when staleness_check is 'graph'. When the field is absent it reads back as 'cited_memories'.",
+            "default": "cited_memories"
+          },
           "refresh_after_consolidation": {
             "type": "boolean",
             "title": "Refresh After Consolidation",
@@ -17187,7 +17227,7 @@
               }
             ],
             "title": "Refresh Cron",
-            "description": "Cron expression (UTC, standard 5-field syntax, e.g. '0 3 * * *' for daily at 03:00 UTC) for refreshing this mental model on a fixed schedule. Mutually exclusive with refresh_after_consolidation \u2014 a model refreshes either after consolidation or on a cron schedule, not both. A scheduled refresh only runs when the model is stale (new memories in its scope since the last refresh); if nothing changed, the tick is skipped to avoid a wasted LLM call. null = no schedule."
+            "description": "Cron expression (UTC, standard 5-field syntax, e.g. '0 3 * * *' for daily at 03:00 UTC) for refreshing this mental model on a fixed schedule. Mutually exclusive with refresh_after_consolidation \u2014 a model refreshes either after consolidation or on a cron schedule, not both. A scheduled refresh only runs when the model is stale (new memories in its scope since the last refresh); if nothing changed, the tick is skipped to avoid a wasted LLM call. In graph mode staleness means a durable change to a provenance memory, not a scope write, so a brand-new memory outside provenance never triggers this schedule. null = no schedule."
           },
           "full_refresh_cron": {
             "anyOf": [

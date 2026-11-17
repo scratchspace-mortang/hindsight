@@ -49,6 +49,7 @@ from .base import (
     MemoryPatch,
     MemoryScopeWatermark,
     ObservationChunkIds,
+    ProvenanceBatch,
     RecallArms,
     RelabelResult,
     RelinkPassResult,
@@ -491,6 +492,28 @@ class PostgresMemories(MemoriesExtension):
     ) -> dict[str, bool]:
         return await reads.any_memory_updated_since_batch(
             conn=conn, fq_table=fq_store_table, bank_id=bank_id, scopes=scopes
+        )
+
+    async def provenance_batch_read(
+        self,
+        *,
+        conn,
+        fq_table,
+        bank_id: str,
+        page_ids: list[str],
+    ) -> dict[str, ProvenanceBatch]:
+        return await reads.provenance_batch_read(conn=conn, fq_table=fq_store_table, bank_id=bank_id, page_ids=page_ids)
+
+    async def purge_change_events_for_subjects(
+        self,
+        *,
+        conn,
+        fq_table,
+        bank_id: str,
+        unit_ids: list[str],
+    ) -> None:
+        await engine_curation.purge_change_events_for_subjects(
+            conn=conn, fq_table=fq_store_table, bank_id=bank_id, unit_ids=unit_ids
         )
 
     async def newest_memory_updated_at(

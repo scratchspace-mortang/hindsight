@@ -303,9 +303,17 @@ async def get_document_with_counts(*, conn, ops, fq_table: Callable[[str], str],
 async def document_source_units(
     *, conn, fq_table: Callable[[str], str], bank_id: str, document_id: str
 ) -> DocumentSourceUnits:
-    """The document's experience/world unit ids, and its total unit count, before a delete."""
+    """The document's experience/world unit ids, and its total unit count, before a delete.
+
+    ``unit_ids`` spans the curation archive as well as the live table: a
+    document-derived memory that was invalidated before the delete still
+    belongs to the document (and its archived row cascades with it), so the
+    delete path's change-record purge must name it too. ``units_count`` is the
+    live total, the number ``memory_units_deleted`` reports.
+    """
     unit_rows = await conn.fetch(
-        f"SELECT id FROM {fq_table('memory_units')} WHERE document_id = $1 AND bank_id = $2 AND fact_type IN ('experience', 'world')",
+        f"SELECT id FROM {fq_table('memory_units')} WHERE document_id = $1 AND bank_id = $2 AND fact_type IN ('experience', 'world') "
+        f"UNION SELECT id FROM {fq_table('invalidated_memory_units')} WHERE document_id = $1 AND bank_id = $2 AND fact_type IN ('experience', 'world')",
         document_id,
         bank_id,
     )
@@ -580,6 +588,10 @@ async def retag_document_memories(
                         other_source_uuids.append(src_id)
                         seen.add(src_str)
 
+            # Change records for the deleted observations go with them.
+            from .engine_curation import purge_change_events_for_subjects  # noqa: PLC0415
+
+            await purge_change_events_for_subjects(conn, fq_table, bank_id, obs_ids)
             await conn.execute(
                 f"DELETE FROM {fq_table('memory_units')} WHERE id = ANY($1::uuid[])",
                 obs_ids,

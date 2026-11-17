@@ -464,6 +464,70 @@ async def test_backup_restore_roundtrip(backup_test_schema):
 
 
 @pytest.mark.asyncio
+async def test_backup_restore_preserves_generated_always_identity_seq(backup_test_schema):
+    """Restore must carry ``memory_change_events.seq`` (GENERATED
+    ALWAYS AS IDENTITY) verbatim through binary COPY, so a page baseline
+    naming a restored seq still means the same record after restore, and
+    the identity sequence resumes above the restored edge."""
+    db_url, schema_name, _fq, _embeddings = backup_test_schema
+    bank_id = f"test-backup-{uuid.uuid4().hex[:8]}"
+    conn = await asyncpg.connect(db_url)
+    try:
+        await conn.execute(f"INSERT INTO {_fq('banks')} (bank_id) VALUES ($1) ON CONFLICT DO NOTHING", bank_id)
+        subject_id = uuid.uuid4()
+        await conn.execute(
+            f"INSERT INTO {_fq('memory_units')} (id, bank_id, text, fact_type) VALUES ($1, $2, 'Alice plays cello.', 'observation')",
+            subject_id,
+            bank_id,
+        )
+        restored_seq = await conn.fetchval(
+            f"""INSERT INTO {_fq('memory_change_events')} (event_id, bank_id, subject_id, event_type)
+                VALUES ($1, $2, $3, 'TEXT_CHANGE') RETURNING seq""",
+            "evt-one",
+            bank_id,
+            subject_id,
+        )
+        assert restored_seq is not None
+    finally:
+        await conn.close()
+
+    with tempfile.NamedTemporaryFile(suffix=".zip", delete=False) as f:
+        backup_path = Path(f.name)
+    try:
+        await _backup(db_url, backup_path, schema=schema_name)
+        conn = await asyncpg.connect(db_url)
+        try:
+            # RESTART IDENTITY resets the sequence to its start: without it
+            # the truncate leaves the sequence at the restored value, so
+            # the next insert passes even if _sync_owned_sequences never
+            # ran. With the reset, only the restore's
+            # sequence sync can put the next value at restored_seq + 1.
+            for table in reversed(BACKUP_TABLES):
+                await conn.execute(f"TRUNCATE TABLE {_fq(table)} RESTART IDENTITY CASCADE")
+        finally:
+            await conn.close()
+        await _restore(db_url, backup_path, schema=schema_name)
+        conn = await asyncpg.connect(db_url)
+        try:
+            seq = await conn.fetchval(
+                f"SELECT seq FROM {_fq('memory_change_events')} WHERE bank_id = $1 AND event_id = 'evt-one'", bank_id
+            )
+            assert seq == restored_seq, "restored seq must be the backed-up identity value"
+            next_seq = await conn.fetchval(
+                f"""INSERT INTO {_fq('memory_change_events')} (event_id, bank_id, subject_id, event_type)
+                    VALUES ('evt-next', $1, $2, 'TEXT_CHANGE') RETURNING seq""",
+                bank_id,
+                subject_id,
+            )
+            assert next_seq == restored_seq + 1
+        finally:
+            await conn.close()
+    finally:
+        if backup_path.exists():
+            backup_path.unlink()
+
+
+@pytest.mark.asyncio
 @pytest.mark.memory_backend_incompatible
 async def test_backup_restore_preserves_all_column_types(backup_test_schema):
     """Test that all column types are preserved: vectors, UUIDs, timestamps, JSONB."""

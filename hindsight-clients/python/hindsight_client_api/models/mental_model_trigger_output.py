@@ -31,6 +31,8 @@ class MentalModelTriggerOutput(BaseModel):
     """ # noqa: E501
     budget: Optional[Budget] = None
     mode: Optional[StrictStr] = Field(default='full', description="Refresh mode. 'full' (default) regenerates the mental model content from scratch on each refresh. 'delta' performs surgical edits against the existing content: unchanged sections are preserved byte-for-byte, stale content is removed, new content is added. If the mental model has no existing content, or if the source_query has changed since the last refresh, delta mode falls back to a full regeneration automatically.")
+    staleness_check: Optional[StrictStr] = Field(default='tagscope', description="How this model's staleness is decided. 'tagscope' (default) uses the scope-plus-watermark check; 'graph' uses provenance (the memories the model was built from). When the field is absent it reads back as 'tagscope'. Graph mode is PostgreSQL-only: on a non-Postgres (Oracle) backend there is no change-record table, so a graph-mode model is answered by the tagscope rule there.")
+    graph_stale: Optional[StrictStr] = Field(default='cited_memories', description="Which provenance marks the model stale in graph mode: 'cited_memories' (default) or 'read_memories'. Only meaningful when staleness_check is 'graph'. When the field is absent it reads back as 'cited_memories'.")
     refresh_after_consolidation: Optional[StrictBool] = Field(default=False, description="If true, refresh this mental model after observations consolidation (real-time mode)")
     refresh_cron: Optional[StrictStr] = None
     full_refresh_cron: Optional[StrictStr] = None
@@ -47,7 +49,7 @@ class MentalModelTriggerOutput(BaseModel):
     reflect_search_observations_include_entities: Optional[StrictBool] = None
     response_schema: Optional[Dict[str, Any]] = None
     keep_trace: Optional[StrictBool] = Field(default=False, description="If true, every refresh of this mental model records how it reached its result under reflect_response.trace: the mode it ran in and why, the resolved scope and time window, how many facts retrieval returned versus how many the agent used, the tool and LLM calls, and any delta operations. Only the latest refresh's trace is kept. This is the only way to diagnose a cron- or consolidation-driven refresh after the fact, since no human sees those run. Tool outputs are reduced to result counts to keep the stored trace bounded; use LLM request tracing for raw prompts and responses.")
-    __properties: ClassVar[List[str]] = ["budget", "mode", "refresh_after_consolidation", "refresh_cron", "full_refresh_cron", "min_refresh_interval_seconds", "fact_types", "exclude_mental_models", "exclude_mental_model_ids", "tags_match", "tag_groups", "include_chunks", "recall_max_tokens", "recall_chunks_max_tokens", "reflect_search_observations_max_tokens", "reflect_search_observations_include_entities", "response_schema", "keep_trace"]
+    __properties: ClassVar[List[str]] = ["budget", "mode", "staleness_check", "graph_stale", "refresh_after_consolidation", "refresh_cron", "full_refresh_cron", "min_refresh_interval_seconds", "fact_types", "exclude_mental_models", "exclude_mental_model_ids", "tags_match", "tag_groups", "include_chunks", "recall_max_tokens", "recall_chunks_max_tokens", "reflect_search_observations_max_tokens", "reflect_search_observations_include_entities", "response_schema", "keep_trace"]
 
     @field_validator('mode')
     def mode_validate_enum(cls, value):
@@ -57,6 +59,26 @@ class MentalModelTriggerOutput(BaseModel):
 
         if value not in set(['full', 'delta']):
             raise ValueError("must be one of enum values ('full', 'delta')")
+        return value
+
+    @field_validator('staleness_check')
+    def staleness_check_validate_enum(cls, value):
+        """Validates the enum"""
+        if value is None:
+            return value
+
+        if value not in set(['tagscope', 'graph']):
+            raise ValueError("must be one of enum values ('tagscope', 'graph')")
+        return value
+
+    @field_validator('graph_stale')
+    def graph_stale_validate_enum(cls, value):
+        """Validates the enum"""
+        if value is None:
+            return value
+
+        if value not in set(['cited_memories', 'read_memories']):
+            raise ValueError("must be one of enum values ('cited_memories', 'read_memories')")
         return value
 
     @field_validator('fact_types')
@@ -210,6 +232,8 @@ class MentalModelTriggerOutput(BaseModel):
         _obj = cls.model_validate({
             "budget": obj.get("budget"),
             "mode": obj.get("mode") if obj.get("mode") is not None else 'full',
+            "staleness_check": obj.get("staleness_check") if obj.get("staleness_check") is not None else 'tagscope',
+            "graph_stale": obj.get("graph_stale") if obj.get("graph_stale") is not None else 'cited_memories',
             "refresh_after_consolidation": obj.get("refresh_after_consolidation") if obj.get("refresh_after_consolidation") is not None else False,
             "refresh_cron": obj.get("refresh_cron"),
             "full_refresh_cron": obj.get("full_refresh_cron"),

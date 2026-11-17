@@ -15,7 +15,10 @@ from one place, so we don't spawn a separate ``asyncio`` task per concern:
 - **Scheduled mental model refresh** (configurable check cadence, default 5 min):
   refresh mental models whose ``trigger.refresh_cron`` schedule is due, but only
   when the model is stale (new memories in its scope since its last refresh), so
-  a scheduled tick never burns an LLM call to regenerate identical content. The
+  a scheduled tick never burns an LLM call to regenerate identical content. In
+  graph mode staleness means a durable change to a provenance memory, not a
+  scope write, so a brand-new memory outside provenance never triggers this
+  schedule. The
   per-model schedule lives in the cron expression; this loop only decides when to
   *check*. The same scan runs ``trigger.full_refresh_cron``, the independent
   schedule on which a (typically delta) model gets a full-mode refresh (#4340).

@@ -792,6 +792,63 @@ class MemoryScopeWatermark:
     tag_groups: list | None = None
 
 
+@dataclass(frozen=True)
+class ProvenanceBatch:
+    """One page's provenance facts for the batched graph-staleness decision.
+
+    The batch sibling of the single-path provenance question: the store
+    resolves every fact once per batch (one read) and the
+    engine decides the verdict per page. Field names map to
+    the decision the caller takes:
+
+    * ``cited_ids`` — the memory-backed ``based_on`` ids, in stored order.
+    * ``read_ids`` — the persisted per-refresh read set, or ``None`` when
+      it was never stamped or is not a list (then the page has no usable
+      read provenance). An empty list is a read set, allowed only with
+      ``captured_empty``.
+    * ``cited_source_ids`` / ``read_source_ids`` — the ``source_memory_ids``
+      of the live observations in each traversal set, one hop only.
+      ``source_ids`` is their union (the batch read's observation sources).
+    * ``live_cited_ids`` / ``live_read_ids`` — which of the ids above
+      still exist as live units. ``live_cited_ids`` short of ``cited_ids``
+      is a retracted citation (deletion marks stale in both modes).
+    * ``cited_empty`` — whether the refresh captured an empty cited set
+      (its own marker, distinct from the read set's ``captured_empty``:
+      a refresh can read memories and cite none).
+    * ``change_seqs`` — the newest durable change-record seq per
+      provenance subject (live ids and their observation sources), keyed
+      by unit id. A subject with no record is absent (read as 0): the
+      caller takes the max over its own traversal set above its
+      ``baseline_seq``. Empty for a batch with no graph pages: tagscope
+      pages answer by liveness alone and must not pay for it.
+    * ``baseline_seq`` — the change-event version the page's refresh
+      stamped at commit, or ``None`` when no stamped baseline is usable:
+      freshness is unprovable, so the page reads stale.
+    * ``based_on_present`` — whether ``reflect_response`` carried a
+      ``based_on`` at all (missing provenance stays distinct from a
+      stamped captured-empty set).
+    """
+
+    page_id: str
+    trigger: Any
+    cited_ids: list[str]
+    based_on_present: bool
+    read_ids: list[str] | None
+    captured_empty: bool
+    baseline_seq: int | None
+    cited_source_ids: list[str]
+    read_source_ids: list[str]
+    live_cited_ids: list[str]
+    live_read_ids: list[str]
+    change_seqs: dict[str, int]
+    cited_empty: bool = False
+
+    @property
+    def source_ids(self) -> list[str]:
+        """Every observation source across both traversal sets."""
+        return sorted(set(self.cited_source_ids) | set(self.read_source_ids))
+
+
 @dataclass
 class RelinkPassResult:
     """What one relink drain got through.
@@ -2276,6 +2333,59 @@ class MemoriesExtension(Extension, ABC):
             for scope in scopes
         }
 
+    async def provenance_batch_read(
+        self,
+        *,
+        conn,
+        fq_table,
+        bank_id: str,
+        page_ids: list[str],
+    ) -> dict[str, ProvenanceBatch]:
+        """:class:`ProvenanceBatch` for many pages at once, keyed by page id.
+
+        ``page_ids`` are the keys the caller wants the answer reported
+        under: a mental-model id on the list surface, a knowledge-page id
+        on the tree surface. A store that holds change records answers
+        them together; the default carries no provenance at all, which a
+        caller that also resolves per-page settings reads as defaults
+        (missing provenance fails closed, the staleness rule, on whatever store
+        that did stamp). An empty ``page_ids`` returns ``{}`` without
+        touching the connection.
+        """
+        return {
+            page_id: ProvenanceBatch(
+                page_id=page_id,
+                trigger=None,
+                cited_ids=[],
+                based_on_present=False,
+                read_ids=None,
+                captured_empty=False,
+                baseline_seq=None,
+                cited_source_ids=[],
+                read_source_ids=[],
+                live_cited_ids=[],
+                live_read_ids=[],
+                change_seqs={},
+            )
+            for page_id in page_ids or []
+        }
+
+    async def purge_change_events_for_subjects(
+        self,
+        *,
+        conn,
+        fq_table,
+        bank_id: str,
+        unit_ids: list[str],
+    ) -> None:
+        """Drop change records whose subject row is being deleted.
+
+        A store with no durable change records answers with a no-op; the
+        engine's delete paths call this beside every subject delete so
+        records never outlive their subjects.
+        """
+        return None
+
     @abstractmethod
     async def newest_memory_updated_at(
         self,
@@ -3148,10 +3258,12 @@ class MemoriesExtension(Extension, ABC):
 
     async def document_source_units(self, *, conn, fq_table, bank_id: str, document_id: str) -> DocumentSourceUnits:
         """The document's experience/world memory ids (for observation cleanup) and its total
-        memory count, read before it is deleted.
+        memory count, read before it is deleted. ``unit_ids`` spans the curation
+        archive too: an invalidated memory still belongs to its document, so the
+        delete path's change-record purge must name it.
 
         Default: a scan of the document's memories and :meth:`document_memory_counts`. Postgres
-        reads `memory_units`."""
+        reads `memory_units` plus `invalidated_memory_units`."""
         sources = await self.scan_all_memories(
             conn=conn, fq_table=fq_table, bank_id=bank_id, document_id=document_id, fact_types=["experience", "world"]
         )

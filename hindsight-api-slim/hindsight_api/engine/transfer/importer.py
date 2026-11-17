@@ -2056,9 +2056,29 @@ def _remap_based_on_ids(payload: dict[str, Any] | None, unit_id_map: dict[str, s
     copied verbatim, so update only evidence ids and preserve all generated text
     and metadata. Older archives without source ids simply have no entries to
     rewrite.
+
+    The graph-staleness provenance rides along: its read set is remapped like
+    ``based_on``, and its baseline is reset to the target bank's version (0).
+    A source-bank baseline names a seq in the source bank's record space,
+    which the target's records do not share; carrying it would let target
+    changes read as already-covered. The target bank
+    starts with no change records, so 0 is exactly its current version.
     """
-    if not payload or not unit_id_map:
+    if not payload:
         return
+    prov = payload.get("graph_provenance")
+    if isinstance(prov, dict):
+        # The baseline reset is not conditional on the id map: a bank
+        # whose page cites no memories exports an empty unit map, and the
+        # source baseline must still not carry into the target's record
+        # space. Id remapping below is the only part an empty map skips.
+        if isinstance(prov.get("baseline_seq"), int):
+            prov["baseline_seq"] = 0
+        if not unit_id_map:
+            return
+        read_ids = prov.get("read_memory_ids")
+        if isinstance(read_ids, list):
+            prov["read_memory_ids"] = [unit_id_map.get(str(x), str(x)) for x in read_ids]
     based_on = payload.get("based_on")
     if not isinstance(based_on, dict):
         return

@@ -106,7 +106,7 @@ for _, root := range tree.Roots {
 | `mental_model_id` | The backing mental model (pages only) |
 | `description` | The page's source query — the question that rebuilds it |
 | `timestamp` | Last refresh for a page, last update for a folder |
-| `is_stale` | Pages only: `true` when a memory in *this page's* scope has been written since the page last read the memories (see below) |
+| `is_stale` | Pages only: `true` when a memory in *this page's* scope has been written since the page last read the memories (tagscope rule), when a memory the page cites has been deleted (both modes), or in graph mode when a provenance memory changed or was deleted (see below) |
 | `last_refresh_failed_at` | Pages only: when this page's last refresh failed, or `null` when it succeeded. While it is set the page does not rebuild itself on its trigger — an explicit refresh still runs, and a successful one clears it |
 | `managed` | `true` when the node is flagged as system-owned rather than hand-authored |
 
@@ -116,7 +116,7 @@ Each page is answered against its own scope — its tags and its `fact_types` �
 
 The whole tree is answered in one query, so the flag costs the same whether the bank has three pages or three hundred, and [`GET /mental-models/{id}`](./mental-models.md) returns the identical value for the page's backing model.
 
-One thing it does not see: **deletions**. The check asks what has been *written* since the page last read the memories, and deleting an in-scope memory leaves no write behind — a page that cites a deleted fact keeps reporting itself up to date.
+One thing the watermark cannot see: **deletions**. The check asks what has been *written* since the page last read the memories, and deleting an in-scope memory leaves no write behind, but deleting a memory the page cites still marks it stale in both modes (both checks ask that question separately, on the tree and on the single read), and a page in graph mode (`staleness_check: "graph"`) sees read memories too: deleting a cited memory (or, with `graph_stale: "read_memories"`, any memory the refresh read) marks it stale, and a brand-new memory outside every provenance observation never does.
 
 ---
 

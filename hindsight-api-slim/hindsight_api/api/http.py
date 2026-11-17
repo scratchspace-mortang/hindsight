@@ -3253,8 +3253,11 @@ class BankStatsResponse(BaseModel):
         description=(
             "When a memory was last written in this bank — stored, edited, or consolidated (ISO format). "
             "Null if the bank has no memories. A mental model whose `last_memory_seen_at` is at or after "
-            "this is up to date whatever its tags; an older one may need a refresh, which only the single "
-            "mental-model read can confirm."
+            "this is up to date whatever its tags, in tagscope mode — with one exception: it cites a "
+            "memory that has since been deleted, which raises no write and marks it stale anyway "
+            "(see `is_stale`). An older one may need a refresh, "
+            "which only the single mental-model read can confirm. In graph mode staleness follows the "
+            "provenance baseline instead of the scope, so `is_stale` decides."
         ),
     )
     pending_consolidation: int = Field(
@@ -3463,8 +3466,11 @@ class MentalModelResponse(BaseModel):
             "How far through the bank's memories this model is written — the newest in-scope memory "
             "the last refresh saw, in ISO format. Stands still when nothing in the model's scope has "
             "been written, however often it is refreshed. At or after the bank's `last_memory_write_at` "
-            "(GET /stats) the model is provably up to date; when it is older, `is_stale` settles it "
-            "against the model's own scope. Null for a model no refresh has stamped yet."
+            "(GET /stats) the model is up to date in tagscope mode — with one exception: it cites a "
+            "memory that has since been deleted, which raises no write and marks it stale anyway "
+            "(see `is_stale`); in graph mode staleness follows the "
+            "provenance baseline instead of the scope, so `is_stale` decides. When it is older, `is_stale` "
+            "settles it against the model's own scope. Null for a model no refresh has stamped yet."
         ),
     )
     last_refresh_failed_at: str | None = Field(
@@ -3511,8 +3517,12 @@ class MentalModelResponse(BaseModel):
             "True when memories matching this mental model's tag/fact_type scope have been written "
             "since last_memory_seen_at — the same check that decides whether a scheduled refresh "
             "does any work, so a model flagged here is one a refresh would actually rewrite. "
-            "Populated on both the single read and the list. Deletions are not observed: removing "
-            "an in-scope memory leaves no write behind, so it does not raise this flag."
+            "Populated on both the single read and the list. Deleting a memory this model was "
+            "built from also raises this flag in both modes (removing a cited memory leaves no "
+            "write behind, so it is asked separately); in graph mode a change to a provenance "
+            "memory raises it too. In graph mode the rule is the provenance baseline instead of the "
+            "scope: a brand-new memory outside every provenance observation never raises this flag. "
+            "Deleting a memory the model never cited or read does not."
         ),
     )
 
@@ -3553,8 +3563,11 @@ class PageNode(BaseModel):
         description="Pages only, populated by the tree endpoint. True when a memory in *this page's* "
         "scope — its tags and fact types — has been written since the page last read the memories. "
         "That is the same check a scheduled refresh runs before spending an LLM call, so a flagged page "
-        "is one a refresh would actually rewrite. Deletions are not observed: removing an in-scope memory "
-        "leaves no write behind, so it does not raise this flag.",
+        "is one a refresh would actually rewrite. Deleting a memory this page was built from also "
+        "raises this flag in both modes; in graph mode a change to a provenance memory raises it too. "
+        "In graph mode the rule is the provenance baseline instead of the scope: a brand-new memory outside "
+        "every provenance observation never raises this flag. "
+        "Deleting a memory the page never cited or read does not.",
     )
     last_refresh_failed_at: str | None = Field(
         default=None,

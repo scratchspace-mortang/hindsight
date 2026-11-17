@@ -1550,11 +1550,18 @@ class TestMentalModelStaleness:
                 )
                 for name, mm in models.items()
             }
-            batched = await memory.compute_mental_models_are_stale(
+            # Keyed by the real page id: the batch fails closed for any
+            # stamped key that resolves no provenance row, so synthetic
+            # names are not valid keys.
+            by_id = await memory.compute_mental_models_are_stale(
                 conn,
                 bank_id,
-                {name: _mental_model_stale_scope_from_row(row, key=name) for name, row in rows.items()},
+                {
+                    models[name]["id"]: _mental_model_stale_scope_from_row(row, key=models[name]["id"])
+                    for name, row in rows.items()
+                },
             )
+            batched = {name: by_id[models[name]["id"]] for name in rows}
             one_at_a_time = {
                 name: await memory.compute_mental_model_is_stale(conn, bank_id, row) for name, row in rows.items()
             }
@@ -1801,9 +1808,9 @@ class TestMentalModelStaleness:
                 mm["id"],
             )
             batched = await memory.compute_mental_models_are_stale(
-                conn, bank_id, {"mm": _mental_model_stale_scope_from_row(row, key="mm")}
+                conn, bank_id, {mm["id"]: _mental_model_stale_scope_from_row(row, key=mm["id"])}
             )
-        assert batched == {"mm": expected}
+        assert batched == {mm["id"]: expected}
         await memory.delete_bank(bank_id, request_context=request_context)
 
     @pytest.mark.memory_backend_incompatible

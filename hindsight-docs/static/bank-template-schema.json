@@ -1229,6 +1229,26 @@
           "title": "Mode",
           "type": "string"
         },
+        "staleness_check": {
+          "default": "tagscope",
+          "description": "How this model's staleness is decided. 'tagscope' (default) uses the scope-plus-watermark check; 'graph' uses provenance (the memories the model was built from). When the field is absent it reads back as 'tagscope'. Graph mode is PostgreSQL-only: on a non-Postgres (Oracle) backend there is no change-record table, so a graph-mode model is answered by the tagscope rule there.",
+          "enum": [
+            "tagscope",
+            "graph"
+          ],
+          "title": "Staleness Check",
+          "type": "string"
+        },
+        "graph_stale": {
+          "default": "cited_memories",
+          "description": "Which provenance marks the model stale in graph mode: 'cited_memories' (default) or 'read_memories'. Only meaningful when staleness_check is 'graph'. When the field is absent it reads back as 'cited_memories'.",
+          "enum": [
+            "cited_memories",
+            "read_memories"
+          ],
+          "title": "Graph Stale",
+          "type": "string"
+        },
         "refresh_after_consolidation": {
           "default": false,
           "description": "If true, refresh this mental model after observations consolidation (real-time mode)",
@@ -1245,7 +1265,7 @@
             }
           ],
           "default": null,
-          "description": "Cron expression (UTC, standard 5-field syntax, e.g. '0 3 * * *' for daily at 03:00 UTC) for refreshing this mental model on a fixed schedule. Mutually exclusive with refresh_after_consolidation \u2014 a model refreshes either after consolidation or on a cron schedule, not both. A scheduled refresh only runs when the model is stale (new memories in its scope since the last refresh); if nothing changed, the tick is skipped to avoid a wasted LLM call. null = no schedule.",
+          "description": "Cron expression (UTC, standard 5-field syntax, e.g. '0 3 * * *' for daily at 03:00 UTC) for refreshing this mental model on a fixed schedule. Mutually exclusive with refresh_after_consolidation \u2014 a model refreshes either after consolidation or on a cron schedule, not both. A scheduled refresh only runs when the model is stale (new memories in its scope since the last refresh); if nothing changed, the tick is skipped to avoid a wasted LLM call. In graph mode staleness means a durable change to a provenance memory, not a scope write, so a brand-new memory outside provenance never triggers this schedule. null = no schedule.",
           "title": "Refresh Cron"
         },
         "full_refresh_cron": {

@@ -705,7 +705,7 @@ if TYPE_CHECKING:
     from ..webhooks.url_guard import GuardedWebhookClient
     from . import bank_aliases as bank_aliases_mod
     from .audit import AuditLogEntry, AuditLogListResponse, AuditLogStatsResponse, AuditLogSummary
-    from .memories import MemoriesExtension, MemoryScopeWatermark, ReflectFreshness
+    from .memories import MemoriesExtension, MemoryScopeWatermark, ProvenanceBatch, ReflectFreshness
     from .memories.base import AttachmentRef, EntityResolverHandle, StoredMemory
     from .observation_tree import TreeFolder
     from .prompt_preview import PromptPreview
@@ -2076,6 +2076,10 @@ class _DeltaGate:
     kept: dict[str, list[MemoryFact]]
     """The ones it said could change the page, plus the bank's directives when any were
     kept, shaped like reflect's ``based_on``."""
+    listed_ids: list[str] = field(default_factory=list)
+    """Every listed memory id, kept and gate-rejected alike: the read set the
+    refresh persists, so a rejected memory's later change can
+    still mark the page stale."""
 
     @property
     def memories_kept(self) -> int:
@@ -2364,6 +2368,94 @@ def _count_retrieved_facts(tool_trace: list[ToolCallTrace]) -> dict[str, int]:
             for model in output.get("mental_models") or []:
                 _tally("mental-models", model.get("id"))
     return counts
+
+
+#: reflect_response key carrying the graph-staleness provenance:
+#: the per-refresh read set, whether that set was captured empty, and the
+#: change-event baseline (consumed seq) stamped at refresh commit.
+_GRAPH_PROVENANCE_KEY = "graph_provenance"
+
+
+def _read_memory_ids_from_tool_trace(tool_trace: list[ToolCallTrace]) -> list[str]:
+    """Memory ids a refresh's tool calls handed back, deduplicated in order.
+
+    The same retrieval ``_count_retrieved_facts`` counts, collected as ids: a
+    graph page in ``read_memories`` mode is built from everything the agent
+    read, not only what it cited, so the read set is the wider provenance.
+    Mental-model hits are pages, not memories, and stay out.
+    """
+    seen: set[str] = set()
+    ids: list[str] = []
+
+    def _add(item_id: Any) -> None:
+        if item_id is not None:
+            text_id = str(item_id)
+            if text_id not in seen:
+                seen.add(text_id)
+                ids.append(text_id)
+
+    for tc in tool_trace:
+        output = tc.output or {}
+        for memory in returned_memories(tc.tool, output):
+            _add(memory.id)
+        if tc.tool == "search_observations":
+            for obs in output.get("observations") or []:
+                _add(obs.get("id"))
+    return ids
+
+
+def _graph_staleness_settings(trigger: Any) -> tuple[str, str]:
+    """``(staleness_check, graph_stale)`` from a stored trigger, with defaults.
+
+    Validation at write time keeps stored values to the listed
+    literals; anything else reads as the defaults rather than raising on a
+    read path.
+    """
+    if isinstance(trigger, str):
+        try:
+            trigger = json.loads(trigger)
+        except json.JSONDecodeError:
+            trigger = None
+    trigger = trigger if isinstance(trigger, dict) else {}
+    staleness_check = trigger.get("staleness_check")
+    graph_stale = trigger.get("graph_stale")
+    return (
+        staleness_check if staleness_check in ("tagscope", "graph") else "tagscope",
+        graph_stale if graph_stale in ("cited_memories", "read_memories") else "cited_memories",
+    )
+
+
+def _graph_provenance(reflect_response: Any) -> dict[str, Any] | None:
+    """The stamped graph provenance, or None when it was never stamped.
+
+    None (missing) is distinct from a stamp whose read set is empty with
+    ``captured_empty`` set: the former fails closed in graph mode, the latter
+    reads fresh against its empty set.
+    """
+    if isinstance(reflect_response, str):
+        try:
+            reflect_response = json.loads(reflect_response)
+        except json.JSONDecodeError:
+            return None
+    if not isinstance(reflect_response, dict):
+        return None
+    prov = reflect_response.get(_GRAPH_PROVENANCE_KEY)
+    return prov if isinstance(prov, dict) else None
+
+
+def _provenance_uuids(ids: list[str]) -> list[uuid.UUID]:
+    """The parseable UUIDs among provenance ids, in order, deduplicated."""
+    seen: set[uuid.UUID] = set()
+    out: list[uuid.UUID] = []
+    for item in ids:
+        try:
+            parsed = uuid.UUID(str(item))
+        except (ValueError, AttributeError, TypeError):
+            continue
+        if parsed not in seen:
+            seen.add(parsed)
+            out.append(parsed)
+    return out
 
 
 #: Tools whose retrieval is bounded by the refresh window. The others (mental-model
@@ -11716,6 +11808,16 @@ class MemoryEngine(MemoryEngineInterface):
                         await enqueue_relink_victims(conn, bank_id, unit_ids)
                         await enqueue_entity_prune_candidates(conn, bank_id, unit_ids)
 
+                    # The facts' change records go with them:
+                    # deleting a document must not leave records for subjects that
+                    # no longer exist. Swept observations purge their own records
+                    # in the sweep above. Goes through the store interface: the
+                    # memory_change_events SQL lives in the store, not here.
+                    if unit_ids:
+                        await _store.purge_change_events_for_subjects(
+                            conn=conn, fq_table=fq_table, bank_id=bank_id, unit_ids=unit_ids
+                        )
+
                     # Delete the document and its memories: the store drops the links in lock order
                     # before the cascade reaches them (#4251), and reads the key of the uploaded
                     # original a file retain kept before the document that names it goes.
@@ -12513,6 +12615,11 @@ class MemoryEngine(MemoryEngineInterface):
                             invalidated_obs = await self._delete_stale_observations_for_memories(
                                 conn, bank_id, unit_ids
                             )
+                        # Change records whose subject is being deleted go
+                        # with it (records must not outlive
+                        # their subject); that purge lives in the store's
+                        # delete_bank_memories_of_type, which can name the
+                        # units while they still exist.
                         # Delete only memories of a specific fact type, live and archived. A store
                         # that owns its memories is told after the commit (delete_where below).
                         await _del_store.delete_bank_memories_of_type(
@@ -12556,6 +12663,17 @@ class MemoryEngine(MemoryEngineInterface):
                         # The bank's rows go, and with them the only record of its pre-tenant-prefix
                         # file keys, which the store reads first for the sweep after the commit.
                         legacy_files = await _del_store.purge_bank_rows(conn=conn, fq_table=fq_table, bank_id=bank_id)
+
+                        # Graph-staleness change records go with the bank:
+                        # they scope by bank_id without a cascading FK, so
+                        # they would otherwise outlive it. Postgres only — the table does not exist on
+                        # Oracle.
+                        from .schema import _is_oracle as _is_oracle_delete  # noqa: PLC0415
+
+                        if not _is_oracle_delete():
+                            await conn.execute(
+                                f"DELETE FROM {fq_table('memory_change_events')} WHERE bank_id = $1", bank_id
+                            )
 
                         # Sweep extension-owned bank-scoped tables (audit receipts,
                         # per-bank policy state, ...). These scope by bank_id without
@@ -18465,7 +18583,7 @@ class MemoryEngine(MemoryEngineInterface):
                 kept["directives"] = [
                     MemoryFact(id=str(d["id"]), text=d["content"], fact_type="directives") for d in directives.items
                 ]
-        return _DeltaGate(listed=listed, kept=kept)
+        return _DeltaGate(listed=listed, kept=kept, listed_ids=[str(m.unit_id) for m in memories])
 
     async def _siblings_are_a_source(
         self,
@@ -18667,6 +18785,23 @@ class MemoryEngine(MemoryEngineInterface):
         refresh_cutoff = await self._mental_model_refresh_cutoff(bank_id, mental_model_id)
         if refresh_cutoff is None:
             return None
+        # Fix the consumed change-event version now, with the read.
+        # The refresh commit stamps exactly this as its provenance baseline,
+        # never a newer one, so an event committing mid-flight stays above
+        # the baseline and the page reads stale. The previous read
+        # set is snapshotted and pruned against liveness in the same capture
+        # Only that previous set is pruned here, so a memory this
+        # refresh reads and that dies mid-flight stays in the persisted set
+        # and the page reads stale (model READ-UND-FLIGHT/DEL-FLIGHT); the
+        # next refresh prunes it at its own refresh start and reads fresh. Pruning
+        # is graph-mode only: tagscope never consumes the read set, so it
+        # asks no liveness question (a store need not implement it there).
+        staleness_check, _graph_stale_mode = _graph_staleness_settings(trigger_data)
+        consumed_event_seq, prev_read_ids_at_capture = await self._mental_model_event_version(
+            bank_id,
+            mental_model_id,
+            prune_previous_read_set=(staleness_check == "graph"),
+        )
         # Run reflect with the source query, excluding the mental model being refreshed
         # Skip creating a nested "hindsight.reflect" span since we already have "hindsight.mental_model_refresh"
         mm_name = mental_model.get("name") or mental_model_id
@@ -18845,6 +18980,15 @@ class MemoryEngine(MemoryEngineInterface):
             },
         )
 
+        # The per-refresh read set: ids from the reflect tool
+        # trace on a reflect path, every gate-listed id (kept and rejected)
+        # on the delta-gate-only path. Persisted in the digest below so
+        # ``read_memories`` mode can answer from what the refresh read.
+        if gate is not None:
+            read_memory_ids: list[str] = list(dict.fromkeys(gate.listed_ids))
+        else:
+            read_memory_ids = _read_memory_ids_from_tool_trace(reflect_result.tool_trace)
+
         # Facts from this reflect only — for the structured-delta LLM prompt.
         # Accumulated based_on below is audit/grounding; re-sending all historical
         # facts each refresh blows past provider input limits (e.g. Z.ai 1261).
@@ -18910,14 +19054,70 @@ class MemoryEngine(MemoryEngineInterface):
                 carried = [f for f in prev_facts if isinstance(f, dict) and f.get("id") not in new_ids]
                 if carried:
                     based_on_serialized_payload.setdefault(ftype, []).extend(carried)
+            # The read set accumulates beside based_on, for the same reason:
+            # a delta page is grounded on everything it has ever read. The
+            # previous set here is the refresh start snapshot: already
+            # pruned against liveness as of refresh start, so a read id that
+            # died *before* this refresh is dropped and the page can read
+            # fresh again, while this refresh's own reads are unioned
+            # unpruned, so a memory read now and deleted mid-flight stays in
+            # the set and the page reads stale; the next refresh prunes it
+            # at its refresh start. No liveness question is asked at stamp time:
+            # pruning the union here would drop exactly those mid-flight
+            # deletions and commit a fresh page built from a retracted memory.
+            # Empty-refresh policy (deliberate): when the previous set prunes
+            # to empty and this refresh reads nothing, the stamp carries
+            # captured_empty=True over the empty live set and reads fresh —
+            # the refresh consumed the deletion state at refresh start (model
+            # PRUNE: STALE refresh start refresh commit -> FRESH), so a dead id does not
+            # poison the verdict forever. A no-sources refresh never reaches
+            # this stamp: it restores the previous stamp instead (below).
+            prev_read = prev_read_ids_at_capture
+            if prev_read is None:
+                # No refresh start snapshot (uninitialized/non-Postgres): fall back
+                # to the stored stamp, unpruned, as before.
+                prev_read = (_graph_provenance(prev_rr) or {}).get("read_memory_ids") or []
+            if prev_read:
+                read_memory_ids = list(dict.fromkeys([*read_memory_ids, *(str(x) for x in prev_read)]))
+            # No stamp-side union of cited ids: the read-mode
+            # superset guarantee lives at the verdict, which unions live
+            # cited ids into the subject set on both paths, so a stamp
+            # written before that union (or by a build that never captured
+            # the citation) is still answered correctly. Stamping cited ids
+            # here as well would keep two mechanisms for one guarantee.
 
         reflect_response_payload: dict[str, Any] = {
             "text": reflect_result.text,
             "based_on": based_on_serialized_payload,
             "mental_models": [],  # Mental models are included in based_on["mental-models"]
+            # Stamped at commit with the consumed version (refresh start), never a
+            # newer one. A refresh that fails before commit must not stamp
+            # it — ``refresh_mental_model`` restores the previous stamp on
+            # its failure paths.
+            _GRAPH_PROVENANCE_KEY: {
+                "read_memory_ids": read_memory_ids,
+                "captured_empty": not read_memory_ids,
+                # The cited set's own empty marker: a
+                # refresh can read memories and cite none, and cited mode
+                # must then read fresh against its empty cited set.
+                # The consumer's own predicate: non-memory
+                # based_on keys (mental-models, directives, opinion) carry ids
+                # the cited-mode reader never sees, so counting them here would
+                # stamp cited_empty False over an empty cited set — stale forever.
+                "cited_empty": not based_on_fact_ids(based_on_serialized_payload),
+                "baseline_seq": consumed_event_seq,
+            },
         }
 
         if not has_sources:
+            # A skipped refresh (nothing in scope to read) stamps no
+            # baseline: restore the previous stamp like the failure path
+            # does, so an event above the old baseline keeps the page stale
+            prev_prov = _graph_provenance(mental_model.get("reflect_response"))
+            if prev_prov is not None:
+                reflect_response_payload[_GRAPH_PROVENANCE_KEY] = prev_prov
+            else:
+                reflect_response_payload.pop(_GRAPH_PROVENANCE_KEY, None)
             # Recorded on the model so a refresh that did nothing says why it did
             # nothing — distinct from a reflect that ran and came back empty-handed.
             reflect_response_payload["reflect_skipped"] = "no_sources_in_scope"
@@ -19148,6 +19348,13 @@ class MemoryEngine(MemoryEngineInterface):
                         reflect_response_payload["based_on"] = prune_based_on(
                             reflect_response_payload["based_on"], retracted.ids
                         )
+                        # The stamp was built before the prune. Resync the
+                        # cited-empty marker with the ids the reader will
+                        # actually see, or a cited set emptied by this refresh
+                        # keeps the page stale on every later tick.
+                        prov = reflect_response_payload.get(_GRAPH_PROVENANCE_KEY)
+                        if isinstance(prov, dict):
+                            prov["cited_empty"] = not based_on_fact_ids(reflect_response_payload["based_on"])
                     return _finish(
                         effective_mode="delta",
                         mode_fallback_reason=None,
@@ -19295,6 +19502,12 @@ class MemoryEngine(MemoryEngineInterface):
                 reflect_response_payload["based_on"] = prune_based_on(
                     reflect_response_payload["based_on"], retracted.ids
                 )
+                # Same resync as the no-new-facts return above: the cited set
+                # the reader sees is the pruned one, so its empty marker must
+                # be derived from that set, not from the pre-prune payload.
+                prov = reflect_response_payload.get(_GRAPH_PROVENANCE_KEY)
+                if isinstance(prov, dict):
+                    prov["cited_empty"] = not based_on_fact_ids(reflect_response_payload["based_on"])
 
             reflect_response_payload["delta_applied"] = delta_applied
             # Skipped ops are recorded whether or not the delta landed: when it did
@@ -19636,6 +19849,15 @@ class MemoryEngine(MemoryEngineInterface):
                 logger.warning(f"[MENTAL_MODELS] Refresh for {mental_model_id} failed ({reason}); {detail}")
                 reflect_response_payload["refresh_skipped"] = reason
                 reflect_response_payload["outcome"] = outcome
+                # A failed refresh is a crash before refresh commit: it stamps no
+                # baseline. Restore the previous provenance stamp
+                # so the payload persisted for audit cannot mark the page
+                # fresh against events it never consumed.
+                prev_prov = _graph_provenance(mental_model.get("reflect_response"))
+                if prev_prov is not None:
+                    reflect_response_payload[_GRAPH_PROVENANCE_KEY] = prev_prov
+                else:
+                    reflect_response_payload.pop(_GRAPH_PROVENANCE_KEY, None)
                 await self.update_mental_model(
                     bank_id,
                     mental_model_id,
@@ -20498,6 +20720,8 @@ class MemoryEngine(MemoryEngineInterface):
         "fact_types": ["observation"],
         "exclude_mental_models": True,
         "refresh_after_consolidation": True,
+        "staleness_check": "tagscope",
+        "graph_stale": "cited_memories",
     }
 
     def _merge_trigger(self, trigger: dict[str, Any] | None, base: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -21575,6 +21799,209 @@ class MemoryEngine(MemoryEngineInterface):
 
         return await get_memories().latest_memory_write_at(conn=conn, fq_table=fq_table, bank_id=bank_id)
 
+    async def _mental_model_event_version(
+        self, bank_id: str, mental_model_id: str, *, prune_previous_read_set: bool = True
+    ) -> tuple[int, list[str] | None]:
+        """The newest durable change-record seq at refresh start (refresh start),
+        with the previous read set snapshotted in the same capture.
+
+        The refresh stamps the seq as its provenance baseline at commit, so an
+        event committing mid-flight (seq above it) reads stale afterwards
+        and the stamp can never cover an event the refresh did not consume.
+        Kept as its own method, like ``_mental_model_refresh_cutoff``,
+        so tests can stub the capture point.
+
+        The second return is the page's previous read set (``None`` when no
+        snapshot could be taken: uninitialized engine or non-Postgres
+        backend). With ``prune_previous_read_set`` it is intersected with
+        liveness inside the same lock and transaction: only the
+        previous set is pruned, never this refresh's own reads (not yet
+        known here), so a read that dies mid-flight stays in the persisted
+        set and the page reads stale, and the next refresh prunes it at its
+        own refresh start. Tagscope callers pass ``prune_previous_read_set=False``:
+        tagscope never consumes the read set, so it asks no liveness
+        question and a store need not implement ``live_memory_ids`` there.
+
+        An uninitialized engine (the mock refresh-wiring tests) has no
+        backend to ask: report 0, exactly as the cutoff/scope stubs do for
+        their own seams. A real refresh always runs initialized.
+
+        The capture takes the same per-bank transaction advisory lock a
+        change-record write takes (see ``record_change_event``) and reads
+        ``max(seq)`` inside that transaction: identity seq is allocated at
+        INSERT time and does not follow commit order, so an unguarded max
+        could stamp a baseline that covers a record allocating an earlier
+        seq but committing later. Under the lock, every
+        seq at or below the captured value has committed, and the refresh's
+        content read that follows sees exactly those records.
+
+        On a non-Postgres backend there is no change-record table: report 0
+        without querying it.
+
+        Blind spot (accepted; not bounded by the weekly schedule, which
+        only refreshes pages the rule already flagged: a memory
+        archived before refresh start is pruned at refresh start. Refresh start prunes O from
+        the read set, so the page's provenance no longer names it and no
+        later record about O can reach it; restore is not a read and
+        re-adds nothing. Supporting detail: restore writes no change
+        record (pg/writes.py:523-592). The page can then read fresh while
+        its text still rests on that memory.
+        """
+        if not getattr(self, "_initialized", False):
+            return 0, None
+        backend = await self._get_backend()
+        async with acquire_with_retry(backend) as conn:
+            if getattr(conn, "backend_type", "postgresql") != "postgresql":
+                return 0, None
+            async with conn.transaction():
+                await conn.execute("SELECT pg_advisory_xact_lock(hashtext($1)::bigint)", bank_id)
+                value = await conn.fetchval(
+                    f"SELECT COALESCE(max(seq), 0) FROM {fq_table('memory_change_events')} "
+                    f"WHERE bank_id = $1 AND EXISTS (SELECT 1 FROM {fq_table('mental_models')} "
+                    f"WHERE bank_id = $1 AND id = $2)",
+                    bank_id,
+                    mental_model_id,
+                )
+                row = await conn.fetchrow(
+                    f"SELECT reflect_response FROM {fq_table('mental_models')} WHERE bank_id = $1 AND id = $2",
+                    bank_id,
+                    mental_model_id,
+                )
+                prev_read_ids: list[str] = []
+                if row is not None:
+                    prov = _graph_provenance(row["reflect_response"])
+                    raw_read_ids = prov.get("read_memory_ids") if prov is not None else None
+                    if isinstance(raw_read_ids, list):
+                        prev_read_ids = [str(x) for x in raw_read_ids]
+                if prune_previous_read_set and prev_read_ids:
+                    from .memories import get_memories
+
+                    live_ids = await get_memories().live_memory_ids(
+                        conn=conn, fq_table=fq_table, bank_id=bank_id, unit_ids=prev_read_ids
+                    )
+                    prev_read_ids = [mid for mid in prev_read_ids if mid in live_ids]
+        return int(value or 0), prev_read_ids
+
+    async def _compute_graph_is_stale(self, conn, bank_id: str, mm_row: Any, *, graph_stale: str) -> bool:
+        """The graph-mode staleness rule.
+
+        True exactly when a durable change record newer than the page's
+        provenance baseline touches its provenance, a cited memory was
+        deleted, or provenance is missing. Provenance is the cited set
+        (``based_on``) in ``cited_memories`` mode and the persisted read set
+        in ``read_memories`` mode, each expanded one hop through the
+        observations it names (their source memories); memory-to-memory
+        edges beyond that hop are never traversed. No scope or watermark
+        question is asked: a bare bump or a NEW_UNLINKED memory records
+        nothing, so neither marks the page stale.
+        """
+        mental_model_id = _mm_row_field(mm_row, "id")
+        reflect_response = _mm_row_field(mm_row, "reflect_response")
+        if reflect_response is None:
+            if mental_model_id is None:
+                return True
+            row = await conn.fetchrow(
+                f"SELECT reflect_response FROM {fq_table('mental_models')} WHERE bank_id = $1 AND id = $2",
+                bank_id,
+                mental_model_id,
+            )
+            if row is None:
+                return True
+            reflect_response = row["reflect_response"]
+        if isinstance(reflect_response, str):
+            try:
+                reflect_response = json.loads(reflect_response)
+            except json.JSONDecodeError:
+                reflect_response = None
+        reflect_response = reflect_response if isinstance(reflect_response, dict) else {}
+
+        prov = _graph_provenance(reflect_response)
+        based_on = reflect_response.get("based_on")
+        cited_ids = based_on_fact_ids(based_on)
+
+        # Deletion of a cited memory marks stale in both modes: a
+        # removed row raises no change record, so this is asked separately,
+        # exactly as the tagscope path asks it second.
+        if cited_ids:
+            from .memories import get_memories
+
+            live_ids = await get_memories().live_memory_ids(
+                conn=conn, fq_table=fq_table, bank_id=bank_id, unit_ids=cited_ids
+            )
+            if len(live_ids) < len(cited_ids):
+                return True
+
+        # Missing provenance fails closed. A stamp that captured an
+        # empty set is provenance, and reads fresh against its empty set.
+        if prov is None:
+            return True
+        baseline = prov.get("baseline_seq")
+        if not isinstance(baseline, int):
+            return True
+        if graph_stale == "read_memories":
+            read_ids = prov.get("read_memory_ids")
+            if not isinstance(read_ids, list):
+                return True
+            read_ids = [str(x) for x in read_ids]
+            if not read_ids and not prov.get("captured_empty"):
+                return True
+            # In read mode the read set is the provenance, so deleting a
+            # read-but-not-cited memory is a provenance deletion, not an
+            # uncited UND.
+            if read_ids:
+                from .memories import get_memories
+
+                live_read = await get_memories().live_memory_ids(
+                    conn=conn, fq_table=fq_table, bank_id=bank_id, unit_ids=read_ids
+                )
+                if len(live_read) < len(read_ids):
+                    return True
+            # Read mode is a superset of cited at the verdict, not only in
+            # the stamp: a cited id carried from a pre-capture
+            # build may be absent from the persisted read set (a lossy
+            # stamp: read ids [], captured_empty), and only the verdict
+            # union keeps it in the edit-detection set. The cited-deletion
+            # question above already proved every cited id live, so the
+            # union cannot re-poison the verdict after a prune.
+            provenance_ids = list(dict.fromkeys([*read_ids, *cited_ids]))
+        else:
+            # The cited set has its own captured-empty marker: a refresh that
+            # read memories but cited none stamps cited_empty, and must read
+            # fresh in cited mode instead of stale-forever. Stamps predating the marker fall back to captured_empty.
+            cited_empty = prov.get("cited_empty", prov.get("captured_empty"))
+            if not cited_ids and not cited_empty:
+                return True
+            if based_on is None and not cited_empty:
+                return True
+            provenance_ids = cited_ids
+
+        subject_uuids = _provenance_uuids(provenance_ids)
+        if not subject_uuids:
+            return False
+        # One hop through observations: an observation's source memories are
+        # provenance of the page that read it. Sources of sources are not.
+        # Through the store: ``memory_units`` is store-owned (#4969).
+        from .memories import get_memories
+
+        stored = await get_memories().get_memories(
+            conn=conn, fq_table=fq_table, bank_id=bank_id, unit_ids=[str(u) for u in subject_uuids]
+        )
+        subjects = {str(m.unit_id) for m in stored}
+        for m in stored:
+            if m.fact_type == "observation":
+                subjects.update(str(s) for s in (m.source_memory_ids or []))
+        subject_uuids = _provenance_uuids(sorted(subjects))
+        if not subject_uuids:
+            return False
+        hit = await conn.fetchval(
+            f"SELECT 1 FROM {fq_table('memory_change_events')} "
+            f"WHERE bank_id = $1 AND subject_id = ANY($2::uuid[]) AND seq > $3 LIMIT 1",
+            bank_id,
+            subject_uuids,
+            baseline,
+        )
+        return hit is not None
+
     async def compute_mental_model_is_stale(
         self,
         conn,
@@ -21596,7 +22023,22 @@ class MemoryEngine(MemoryEngineInterface):
 
         Use :meth:`compute_mental_models_are_stale` when asking about more than one
         model: it is the same question in one round-trip.
+
+        In graph mode (``trigger.staleness_check == "graph"``) the scope and
+        watermark are not consulted at all: the answer comes from the durable
+        change records above the page's provenance baseline
+        (:meth:`_compute_graph_is_stale`). A bare update-time
+        bump and a NEW_UNLINKED memory raise no record, so neither can mark
+        the page stale; missing provenance fails closed.
         """
+        staleness_check, graph_stale = _graph_staleness_settings(_mm_row_field(mm_row, "trigger"))
+        if staleness_check == "graph" and getattr(conn, "backend_type", "postgresql") == "postgresql":
+            return await self._compute_graph_is_stale(conn, bank_id, mm_row, graph_stale=graph_stale)
+        # On a non-Postgres backend there is no change-record table, so there
+        # is no graph verdict to ask: the page falls through to the scope
+        # rule below, exactly as the batch path answers it there; batch and
+        # single paths must agree.
+
         scope = _mental_model_stale_scope_from_row(mm_row, key="")
         if scope is None:
             return True  # Never stamped with a watermark — nothing to be current with.
@@ -21614,12 +22056,11 @@ class MemoryEngine(MemoryEngineInterface):
         #   first question can never see one, and a page could keep stating a fact
         #   for as long as the bank stayed quiet.
         #
-        # Only the single-model path asks the second. The batch variant backs the
-        # polling display surfaces, where main made the whole set one round-trip; a
-        # per-model grounding fetch would undo exactly that. The two refresh
-        # triggers — the after-consolidation flush and the cron loop — both come
-        # through here, so the refresh still fires; a page can briefly read
-        # "up to date" in the list while a refresh for it is already queued.
+        # The batch variant asks the same question inside its one round-trip
+        # (provenance_batch_read), so single and list/tree agree on a cited
+        # deletion. The two refresh triggers — the after-consolidation flush
+        # and the cron loop — both come through here, so the refresh still
+        # fires.
         from .memories import get_memories
 
         cited_ids = await self._cited_fact_ids(conn, bank_id, mm_row)
@@ -21747,6 +22188,50 @@ class MemoryEngine(MemoryEngineInterface):
             )
         return submitted
 
+    def _batch_graph_is_stale(self, prov: "ProvenanceBatch", *, graph_stale: str) -> bool:
+        """One page's graph-mode verdict over its batched provenance.
+
+        Exactly :meth:`_compute_graph_is_stale`'s rule over the flags the
+        store already resolved in :meth:`MemoriesExtension.provenance_batch_read`:
+        a retracted citation marks stale in both modes, missing provenance
+        fails closed, and otherwise a durable change record above the
+        page's baseline over the traversed set — ``based_on`` citations in
+        ``cited_memories`` mode, the read set in ``read_memories`` mode,
+        each expanded one hop through observations — marks stale. A page
+        whose read set never resolves stays out of its own signal: no
+        scope or watermark question is asked here.
+        """
+        if len(prov.live_cited_ids) < len(prov.cited_ids):
+            return True
+        if prov.baseline_seq is None:
+            return True
+        if graph_stale == "read_memories":
+            if prov.read_ids is None:
+                return True
+            if not prov.read_ids and not prov.captured_empty:
+                return True
+            # Read mode: the read set is the provenance, so a deleted read
+            # id marks stale. Live cited ids
+            # and their sources join the subject set: a
+            # pre-capture citation absent from the persisted read set is
+            # still provenance, exactly as the single path unions it.
+            if len(prov.live_read_ids) < len(prov.read_ids):
+                return True
+            subjects = (
+                set(prov.live_read_ids)
+                | set(prov.read_source_ids)
+                | set(prov.live_cited_ids)
+                | set(prov.cited_source_ids)
+            )
+        else:
+            if (not prov.cited_ids and not prov.cited_empty) or (not prov.based_on_present and not prov.cited_empty):
+                return True
+            subjects = set(prov.cited_ids) | set(prov.cited_source_ids)
+        # The single path narrows the subject set to units that still
+        # exist before asking; the store's live lists carry the same
+        # cut, and a subject with no record reads 0 either way.
+        return any(prov.change_seqs.get(subject, 0) > prov.baseline_seq for subject in subjects)
+
     async def compute_mental_models_are_stale(
         self,
         conn,
@@ -21760,17 +22245,23 @@ class MemoryEngine(MemoryEngineInterface):
         Each value is what :func:`_mental_model_stale_scope` resolved for that
         model, or None for a model no refresh has stamped — reported stale without
         a query, as the single-model read reports it. Every other model is answered
-        against its own scope, in one round-trip for the whole set (see the store's
-        ``any_memory_updated_since_batch``).
+        by its own rule, in one round-trip per question for the whole set: the
+        batch scope query for tagscope pages (see the store's
+        ``any_memory_updated_since_batch``) and the batch provenance read for
+        graph pages and for the deletion test (the store's
+        ``provenance_batch_read``), which the batch answers the same way the
+        single path does — the deletion test is no longer skipped.
 
-        The bank's newest write settles most of the set for free: a model that has
-        read the memories at or past it cannot be stale whatever its scope. That is
-        read here (:meth:`_bank_write_watermark`, one index probe) rather than left
+        The bank's newest write settles most of what remains for free: a model that
+        has read the memories at or past it cannot be stale whatever its scope. That
+        is read here (:meth:`_bank_write_watermark`, one index probe) rather than left
         to the caller, so every surface gets it — the mental-model list, the
         page tree and its MCP twin used to ask the scoped question for every
         model on every poll, and the scoped question is only cheap when the model
         *is* stale: a scope whose own tags have been quiet pays a walk of every
-        memory written since its watermark (#4169).
+        memory written since its watermark (#4169). The shortcut settles only the
+        tagscope scope question: a graph page has no scope question, and a
+        deletion raises no watermark, so neither is ever settled by it.
 
         ``watermark`` stays an optional argument for a caller that already holds a
         **live** one — reflect resolves it once per invocation — and passing it
@@ -21779,25 +22270,100 @@ class MemoryEngine(MemoryEngineInterface):
         than a model's own last read and would then prove a freshness that is not
         there.
         """
-        from .memories import get_memories
+        from .memories import get_memories  # noqa: PLC0415
 
         answers: dict[str, bool] = {}
-        pending: list[MemoryScopeWatermark] = []
-        # Read once for the whole set, and only if some model could still be settled
-        # by it — a set of models that have never been stamped needs no watermark.
-        if watermark is None and any(scope is not None for scope in scopes.values()):
-            watermark = await self._bank_write_watermark(conn, bank_id)
+        stamped: dict[str, MemoryScopeWatermark] = {}
+        unscoped: list[str] = []
         for key, scope in scopes.items():
             if scope is None:
+                # A NULL watermark (scope None) does not settle a graph
+                # page: the single path asks provenance for it, so the batch
+                # asks too instead of answering stale without it. Tagscope pages with no watermark
+                # still read stale, as the single path answers them.
+                unscoped.append(key)
+            else:
+                stamped[key] = scope
+
+        if getattr(conn, "backend_type", "postgresql") != "postgresql":
+            # Oracle carries no change-record table, so it has no graph
+            # verdicts to batch: the scope rule and its watermark shortcut
+            # answer the whole set, exactly as before this change. Gated on the
+            # backend alone: an all-unscoped set must answer
+            # without any provenance read, which is where the missing table
+            # used to be queried.
+            for key in unscoped:
+                answers[key] = True
+            pending: list[MemoryScopeWatermark] = []
+            if stamped and watermark is None:
+                watermark = await self._bank_write_watermark(conn, bank_id)
+            for scope in stamped.values():
+                if not _may_need_refresh(scope.since, watermark):
+                    answers[scope.key] = False
+                else:
+                    pending.append(scope)
+            if pending:
+                answers.update(
+                    await get_memories().any_memory_updated_since_batch(
+                        conn=conn, fq_table=fq_table, bank_id=bank_id, scopes=pending
+                    )
+                )
+            return answers
+
+        if stamped or unscoped:
+            prov_map: "dict[str, ProvenanceBatch]" = await get_memories().provenance_batch_read(
+                conn=conn, fq_table=fq_table, bank_id=bank_id, page_ids=[*stamped.keys(), *unscoped]
+            )
+        else:
+            prov_map = {}
+
+        for key in unscoped:
+            prov = prov_map.get(key)
+            if prov is not None and _graph_staleness_settings(prov.trigger)[0] == "graph":
+                answers[key] = self._batch_graph_is_stale(prov, graph_stale=_graph_staleness_settings(prov.trigger)[1])
+            else:
+                answers[key] = True
+
+        tagscope_pending: list[MemoryScopeWatermark] = []
+        for key, scope in stamped.items():
+            prov = prov_map.get(key)
+            if prov is None:
+                # Every production caller keys this batch by a real page
+                # id (mental-model id, knowledge-page id, or a bank-template
+                # slug such as "sentiment-overview"), and the store
+                # resolves both. A stamped scope whose key resolves no
+                # provenance row therefore means the page row vanished
+                # between the caller's scope read and this provenance read
+                # — whatever shape the id has. Fail closed, exactly as the
+                # single path answers a missing row (never fresh); there is
+                # no id-shape predicate to keep current, and synthetic
+                # keys must be real page ids.
                 answers[key] = True
                 continue
-            if not _may_need_refresh(scope.since, watermark):
-                # Exact, and one index probe for the whole set: nothing in the bank
-                # has been written since this model read the memories, so nothing in
-                # its scope has either.
-                answers[key] = False
+            staleness_check, graph_stale = _graph_staleness_settings(prov.trigger)
+            if staleness_check == "graph":
+                answers[key] = self._batch_graph_is_stale(prov, graph_stale=graph_stale)
                 continue
-            pending.append(scope)
+            # Deletion marks stale in both modes, and raises no watermark,
+            # so it is asked before the shortcut gets to settle anything.
+            if len(prov.live_cited_ids) < len(prov.cited_ids):
+                answers[key] = True
+                continue
+            tagscope_pending.append(scope)
+
+        # The shortcut, asked only over the tagscope survivors it can settle.
+        pending: list[MemoryScopeWatermark] = []
+        if tagscope_pending:
+            if watermark is None:
+                watermark = await self._bank_write_watermark(conn, bank_id)
+            for scope in tagscope_pending:
+                if not _may_need_refresh(scope.since, watermark):
+                    # Exact, and one index probe for the whole set: nothing in the bank
+                    # has been written since this model read the memories, so nothing in
+                    # its scope has either.
+                    answers[scope.key] = False
+                else:
+                    pending.append(scope)
 
         if pending:
             answers.update(

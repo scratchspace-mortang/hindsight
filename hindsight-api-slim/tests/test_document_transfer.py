@@ -358,6 +358,55 @@ def test_remap_mental_model_evidence_updates_current_and_history():
     assert history_content["previous_content"] == "an earlier draft"
 
 
+def test_remap_mental_model_evidence_remaps_read_set_and_resets_baseline():
+    """Transfer must remap the graph read set through the unit-id map
+    and reset the provenance baseline to the target bank's version (0),
+    never carrying the source bank's seq space or unremapped ids."""
+    from hindsight_api.engine.transfer.importer import _remap_mental_model_evidence
+
+    rows = [
+        {
+            "reflect_response": {
+                "based_on": {"world": [{"id": "old", "text": "fact"}]},
+                "graph_provenance": {
+                    "read_memory_ids": ["old", "obs-old", "gone"],
+                    "captured_empty": False,
+                    "baseline_seq": 987654,
+                },
+            }
+        }
+    ]
+    _remap_mental_model_evidence(rows, {"old": "new", "obs-old": "obs-new"})
+    prov = rows[0]["reflect_response"]["graph_provenance"]
+    # Known ids remap; an id with no mapping stays, exactly like based_on.
+    assert prov["read_memory_ids"] == ["new", "obs-new", "gone"], "read set must be remapped like based_on"
+    assert prov["baseline_seq"] == 0, "source-bank baseline must not carry into the target bank"
+
+
+def test_remap_mental_model_evidence_resets_baseline_with_empty_unit_map():
+    """The baseline reset is not conditional on the unit-id map. A
+    bank exported with a page but no memories has an empty map, and the
+    source baseline must still reset to the target bank's version (0) —
+    carrying it would name a seq in the source bank's record space."""
+    from hindsight_api.engine.transfer.importer import _remap_mental_model_evidence
+
+    rows = [
+        {
+            "reflect_response": {
+                "based_on": {},
+                "graph_provenance": {
+                    "read_memory_ids": [],
+                    "captured_empty": True,
+                    "baseline_seq": 987654,
+                },
+            }
+        }
+    ]
+    _remap_mental_model_evidence(rows, {})
+    prov = rows[0]["reflect_response"]["graph_provenance"]
+    assert prov["baseline_seq"] == 0, "source-bank baseline must not carry into the target bank"
+
+
 def test_topological_page_order_is_parent_first():
     """Nodes always sort so a parent precedes its children (self-FK safe)."""
     from hindsight_api.engine.transfer.importer import _topological_page_order

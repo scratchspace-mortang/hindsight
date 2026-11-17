@@ -504,11 +504,18 @@ async def test_dedup_update_merge_folds_into_twin_and_deletes_updated() -> None:
     assert fold_args[3] == uuid.UUID(_UPDATED_ID)  # folded-from = the updated row
     assert fold_args[6] == conn.fetchrow_result["source_memory_ids"]  # only live updated-row sources
     # Then the updated row is deleted: DELETE of the row, and DELETE of its observation_history
-    # (no longer cascaded from memory_units — that FK was dropped).
-    assert conn.execute.await_count == 2
-    delete_args = conn.execute.await_args_list[0].args
+    # (no longer cascaded from memory_units — that FK was dropped). The third
+    # execute is the per-bank advisory lock the change-record write takes, and
+    # the fourth is the graph-staleness change-event insert (one durable record
+    # for the fold, written transactionally with it). The fifth is the deleted
+    # row's own change records purged with it.
+    assert conn.execute.await_count == 5
+    purge_args = conn.execute.await_args_list[2].args
+    assert "memory_change_events" in purge_args[0]
+    assert uuid.UUID(_UPDATED_ID) in purge_args[2]  # the deleted row's records go with it
+    delete_args = conn.execute.await_args_list[3].args
     assert delete_args[1] == uuid.UUID(_UPDATED_ID)  # the updated row is deleted
-    history_delete_args = conn.execute.await_args_list[1].args
+    history_delete_args = conn.execute.await_args_list[4].args
     assert history_delete_args[2] == uuid.UUID(_UPDATED_ID)  # its history is reclaimed too
 
 

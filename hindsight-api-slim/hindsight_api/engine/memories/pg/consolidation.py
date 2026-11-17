@@ -8,6 +8,8 @@ transaction, so every write derived from one LLM response commits or rolls back 
 
 from __future__ import annotations
 
+import hashlib
+import json
 import uuid
 from collections.abc import Callable
 from datetime import datetime
@@ -17,6 +19,191 @@ from ....config import get_config
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from ...consolidation.consolidator import _TemporalBounds
+
+#: Change-record event types: TEXT_CHANGE for a consolidation text rewrite,
+#: FOLD_IN for a new source id on a read observation, SRC_EDIT for a
+#: source-memory edit/refine/supersede/invalidate.
+TEXT_CHANGE = "TEXT_CHANGE"
+FOLD_IN = "FOLD_IN"
+SRC_EDIT = "SRC_EDIT"
+
+
+def _is_postgres(conn) -> bool:
+    """Whether ``conn`` targets Postgres (the only backend with change records)."""
+    return getattr(conn, "backend_type", "postgresql") == "postgresql"
+
+
+def _row_version_token(row) -> str:
+    """The row's pre-write version token, for a stable event identity.
+
+    Tolerant of rows that carry no ``updated_at`` (mock connections in unit
+    tests): such a token is empty, and the derived identity still
+    deduplicates a replayed identical call.
+    """
+    try:
+        value = row["updated_at"]
+    except (KeyError, IndexError, TypeError):
+        return ""
+    return str(value)
+
+
+def stable_event_id(
+    *,
+    bank_id: str,
+    subject_id: str | uuid.UUID,
+    event_type: str,
+    version_token: str,
+    before_text: str | None = None,
+    after_text: str | None = None,
+    detail: dict | None = None,
+) -> str:
+    """A stable identity for one committed transition.
+
+    The version token is the subject row's own pre-write identity (its
+    ``updated_at`` at the read that gated the write): a replay of the same
+    write carries the same token and deduplicates, while a distinct later
+    transition of the same row carries a new token and records even when its
+    before/after values repeat an earlier transition's. ``detail`` is part of
+    the identity when the caller supplies one: two folds of
+    one row in one transaction share the token and the before/after values
+    but carry different ``added_source_ids``, and omitting the detail would
+    collapse them to one record and lose the second fold's audit detail.
+    A retry replays the same detail, so the same transition still dedupes.
+    """
+    payload = json.dumps(
+        {
+            "bank_id": bank_id,
+            "subject_id": str(subject_id),
+            "event_type": event_type,
+            "version_token": version_token,
+            "before_text": before_text,
+            "after_text": after_text,
+            "detail": detail,
+        },
+        sort_keys=True,
+        default=str,
+    )
+    return f"{event_type.lower()}:{hashlib.sha256(payload.encode()).hexdigest()[:32]}"
+
+
+def _derived_event_id(
+    *,
+    bank_id: str,
+    subject_id: str | uuid.UUID,
+    event_type: str,
+    before_text: str | None,
+    after_text: str | None,
+    detail: dict | None,
+) -> str:
+    """The identity for a call that supplied none: derived from the transition
+    itself, so a replayed call with identical arguments deduplicates instead
+    of minting a fresh identity per retry. Write sites
+    that know the row's version token pass an explicit stable id instead,
+    which keeps distinct transitions with identical values apart."""
+    payload = json.dumps(
+        {
+            "bank_id": bank_id,
+            "subject_id": str(subject_id),
+            "event_type": event_type,
+            "before_text": before_text,
+            "after_text": after_text,
+            "detail": detail,
+        },
+        sort_keys=True,
+        default=str,
+    )
+    return f"{event_type.lower()}:{hashlib.sha256(payload.encode()).hexdigest()[:32]}"
+
+
+def _text_changed(before: str, after: str) -> bool:
+    """The server-side before/after verdict (owned by the
+    consolidation worker). Imported lazily: the consolidator reaches this
+    module through the memories store, so a module-level import would cycle.
+    """
+    from ...consolidation.consolidator import compare_text  # noqa: PLC0415
+
+    return compare_text(before, after)
+
+
+async def record_change_event(
+    *,
+    conn,
+    fq_table: Callable[[str], str],
+    bank_id: str,
+    subject_id: str | uuid.UUID,
+    event_type: str,
+    event_id: str | None = None,
+    before_text: str | None = None,
+    after_text: str | None = None,
+    detail: dict | None = None,
+) -> None:
+    """Write one durable, timestamped change record on the caller's connection.
+
+    Runs inside whatever transaction the caller already holds, so the record
+    commits or rolls back with the write it describes. ``event_id`` is the
+    stable operation identity: a retry replaying the same identity inserts
+    nothing (unique index on ``(bank_id, event_id)``), while distinct
+    committed transitions record even when their before/after values repeat —
+    identity, never values, deduplicates. A caller that supplies no id gets
+    one derived from the transition itself, so a replayed call with identical
+    arguments still deduplicates; write sites that know the row's version
+    token pass an explicit stable id, which keeps distinct transitions with
+    identical values apart.
+
+    The change-record table exists only on Postgres (its migration runs for
+    pg), so on Oracle this is a no-op: the consolidation rewrite path runs
+    there and must not fail on the missing table.
+
+    Before inserting, the call takes a per-bank transaction advisory lock.
+    ``seq`` is an identity allocated at INSERT time, which does not follow
+    commit order: a record can allocate seq N and commit long after a later
+    seq. The advisory lock serializes record commits per bank, so every seq
+    at or below a baseline captured under the same lock (the refresh's
+    refresh start capture) has already committed, and every later-committing record
+    allocates a higher seq. The lock is held to the
+    caller's transaction end, which the caller must hold for atomicity with
+    the write in any case.
+    """
+    from ...schema import _is_oracle  # noqa: PLC0415
+
+    if _is_oracle() or not _is_postgres(conn):
+        return
+    # The advisory lock below is xact-scoped: outside a transaction each
+    # statement autocommits and the ordering guarantee it buys would silently
+    # vanish. Fail loud instead; every writer's
+    # caller holds the transaction that carries the record. asyncpg names
+    # the probe ``is_in_transaction`` and the PostgresConnection wrapper
+    # exposes ``in_transaction``; accept either.
+    in_transaction = getattr(conn, "in_transaction", None) or getattr(conn, "is_in_transaction", None)
+    if callable(in_transaction) and not in_transaction():
+        raise RuntimeError(
+            "record_change_event requires an open transaction: the per-bank advisory lock "
+            "serializing record commits only holds inside one"
+        )
+    await conn.execute("SELECT pg_advisory_xact_lock(hashtext($1)::bigint)", bank_id)
+    await conn.execute(
+        f"""
+        INSERT INTO {fq_table("memory_change_events")}
+            (event_id, bank_id, subject_id, event_type, before_text, after_text, detail)
+        VALUES ($1, $2, $3, $4, $5, $6, $7)
+        ON CONFLICT (bank_id, event_id) DO NOTHING
+        """,
+        event_id
+        or _derived_event_id(
+            bank_id=bank_id,
+            subject_id=subject_id,
+            event_type=event_type,
+            before_text=before_text,
+            after_text=after_text,
+            detail=detail,
+        ),
+        bank_id,
+        uuid.UUID(str(subject_id)),
+        event_type,
+        before_text,
+        after_text,
+        json.dumps(detail) if detail is not None else None,
+    )
 
 
 def _search_vector_clause(param: str) -> str:
@@ -162,10 +349,24 @@ async def fold_sources_into_observation(
     Keeps the observation's existing embedding (the merged text is >= threshold similar, so it
     stays representative and avoids a re-embed + a dialect-specific vector UPDATE). False when
     the row vanished or was rewritten since ``expected_text`` was read.
+
+    Records the durable change events transactionally with the fold: a TEXT_CHANGE
+    when the text moved, a FOLD_IN when a new source id appeared — a fold-in
+    with unchanged text still records the source addition, and one with
+    neither records nothing.
     """
     # RETURNING-gate on the twin's probe-time text so a concurrent
     # survivor rewrite during the connection-free LLM window can't be clobbered.
     search_vector_clause = _search_vector_clause("$1")
+    # The pre-fold sources, read under the same text gate the UPDATE uses, so
+    # the FOLD_IN record names exactly the ids this fold added.
+    current = await conn.fetchrow(
+        f"SELECT bank_id, source_memory_ids, updated_at FROM {fq_table('memory_units')} WHERE id = $1::uuid AND text = $2",
+        uuid.UUID(observation_id),
+        expected_text,
+    )
+    known_source_ids = {str(s) for s in (current["source_memory_ids"] or [])} if current is not None else set()
+    added_source_ids = [str(s) for s in dict.fromkeys(source_memory_ids) if str(s) not in known_source_ids]
     folded = await conn.fetchval(
         f"""
             UPDATE {fq_table("memory_units")}
@@ -189,6 +390,46 @@ async def fold_sources_into_observation(
         bounds.occurred_end,
         bounds.mentioned_at,
     )
+    if folded is not None and current is not None:
+        version_token = _row_version_token(current)
+        if _text_changed(expected_text, merged_text):
+            await record_change_event(
+                conn=conn,
+                fq_table=fq_table,
+                bank_id=current["bank_id"],
+                subject_id=observation_id,
+                event_type=TEXT_CHANGE,
+                event_id=stable_event_id(
+                    bank_id=current["bank_id"],
+                    subject_id=observation_id,
+                    event_type=TEXT_CHANGE,
+                    version_token=version_token,
+                    before_text=expected_text,
+                    after_text=merged_text,
+                ),
+                before_text=expected_text,
+                after_text=merged_text,
+            )
+        if added_source_ids:
+            await record_change_event(
+                conn=conn,
+                fq_table=fq_table,
+                bank_id=current["bank_id"],
+                subject_id=observation_id,
+                event_type=FOLD_IN,
+                event_id=stable_event_id(
+                    bank_id=current["bank_id"],
+                    subject_id=observation_id,
+                    event_type=FOLD_IN,
+                    version_token=version_token,
+                    before_text=expected_text,
+                    after_text=merged_text,
+                    detail={"added_source_ids": added_source_ids},
+                ),
+                before_text=expected_text,
+                after_text=merged_text,
+                detail={"added_source_ids": added_source_ids},
+            )
     return folded is not None
 
 
@@ -232,6 +473,15 @@ async def fold_observation_into_twin(
     live_u_sources = [mid for mid in sources if str(mid) in live]
     if not live_u_sources:
         return False
+    # The twin's pre-fold sources, under the same text gate the UPDATE uses,
+    # so the FOLD_IN record names exactly the ids this fold added to it.
+    twin = await conn.fetchrow(
+        f"SELECT source_memory_ids, updated_at FROM {fq_table('memory_units')} WHERE id = $1::uuid AND text = $2",
+        uuid.UUID(twin_id),
+        twin_text,
+    )
+    known_twin_source_ids = {str(s) for s in (twin["source_memory_ids"] or [])} if twin is not None else set()
+    added_to_twin = [str(s) for s in dict.fromkeys(live_u_sources) if str(s) not in known_twin_source_ids]
     # RETURNING-gate on both rows' probe-time text so a survivor/updated rewrite during
     # the connection-free LLM window can't be clobbered or fold a stale row.
     search_vector_clause = _search_vector_clause("$1")
@@ -263,6 +513,46 @@ async def fold_observation_into_twin(
     )
     # None: twin or updated row vanished during the LLM window — the caller keeps the
     # updated row as a distinct observation instead of deleting it unfolded.
+    if folded is not None and twin is not None:
+        version_token = _row_version_token(twin)
+        if _text_changed(twin_text, merged_text):
+            await record_change_event(
+                conn=conn,
+                fq_table=fq_table,
+                bank_id=bank_id,
+                subject_id=twin_id,
+                event_type=TEXT_CHANGE,
+                event_id=stable_event_id(
+                    bank_id=bank_id,
+                    subject_id=twin_id,
+                    event_type=TEXT_CHANGE,
+                    version_token=version_token,
+                    before_text=twin_text,
+                    after_text=merged_text,
+                ),
+                before_text=twin_text,
+                after_text=merged_text,
+            )
+        if added_to_twin:
+            await record_change_event(
+                conn=conn,
+                fq_table=fq_table,
+                bank_id=bank_id,
+                subject_id=twin_id,
+                event_type=FOLD_IN,
+                event_id=stable_event_id(
+                    bank_id=bank_id,
+                    subject_id=twin_id,
+                    event_type=FOLD_IN,
+                    version_token=version_token,
+                    before_text=twin_text,
+                    after_text=merged_text,
+                    detail={"added_source_ids": added_to_twin},
+                ),
+                before_text=twin_text,
+                after_text=merged_text,
+                detail={"added_source_ids": added_to_twin},
+            )
     return folded is not None
 
 
@@ -277,8 +567,26 @@ async def rewrite_observation(
     tags: list[str],
     bounds: _TemporalBounds,
 ) -> bool:
-    """Rewrite an observation in place, widening its dates by ``bounds``. False if the row is gone."""
+    """Rewrite an observation in place, widening its dates by ``bounds``. False if the row is gone.
+
+    A changed text records a durable TEXT_CHANGE event on the
+    caller's transaction; a new source id records a FOLD_IN even when the
+    text is unchanged (this UPDATE replaces the
+    whole source set, so it is a fold-in site like the fold paths); neither
+    records nothing.
+    """
     search_vector_clause = _search_vector_clause("$1")
+    # The stored text and sources before this write: the "before" of the
+    # server-side compare (inventory H1 - before and after are in this scope)
+    # and the pre-write source set the FOLD_IN record diffs against. Read
+    # first because the UPDATE below overwrites both.
+    current = await conn.fetchrow(
+        f"SELECT bank_id, text, source_memory_ids, updated_at FROM {fq_table('memory_units')} WHERE id = $1",
+        uuid.UUID(observation_id),
+    )
+    before_text = current["text"] if current is not None else None
+    known_source_ids = {str(s) for s in (current["source_memory_ids"] or [])} if current is not None else set()
+    added_source_ids = [str(s) for s in dict.fromkeys(source_memory_ids) if str(s) not in known_source_ids]
     # Unlike the dedup folds this statement also runs on Oracle, where LEAST/GREATEST
     # return NULL as soon as ANY argument is NULL (PostgreSQL ignores NULL arguments).
     # The inner COALESCE covers a NULL *parameter*; the outer one covers a NULL
@@ -314,6 +622,46 @@ async def rewrite_observation(
         bounds.mentioned_at,
         tags,
     )
+    if updated_rows != 0 and before_text is not None:
+        version_token = _row_version_token(current)
+        if _text_changed(before_text, text):
+            await record_change_event(
+                conn=conn,
+                fq_table=fq_table,
+                bank_id=current["bank_id"],
+                subject_id=observation_id,
+                event_type=TEXT_CHANGE,
+                event_id=stable_event_id(
+                    bank_id=current["bank_id"],
+                    subject_id=observation_id,
+                    event_type=TEXT_CHANGE,
+                    version_token=version_token,
+                    before_text=before_text,
+                    after_text=text,
+                ),
+                before_text=before_text,
+                after_text=text,
+            )
+        if added_source_ids:
+            await record_change_event(
+                conn=conn,
+                fq_table=fq_table,
+                bank_id=current["bank_id"],
+                subject_id=observation_id,
+                event_type=FOLD_IN,
+                event_id=stable_event_id(
+                    bank_id=current["bank_id"],
+                    subject_id=observation_id,
+                    event_type=FOLD_IN,
+                    version_token=version_token,
+                    before_text=before_text,
+                    after_text=text,
+                    detail={"added_source_ids": added_source_ids},
+                ),
+                before_text=before_text,
+                after_text=text,
+                detail={"added_source_ids": added_source_ids},
+            )
     return updated_rows != 0
 
 
@@ -376,6 +724,10 @@ async def insert_observation(
 
 async def delete_observation(*, conn, fq_table: Callable[[str], str], bank_id: str, observation_id: str) -> None:
     """Delete one observation row (the caller drops its history)."""
+    # Its change records go with it.
+    from .engine_curation import purge_change_events_for_subjects  # noqa: PLC0415
+
+    await purge_change_events_for_subjects(conn, fq_table, bank_id, [observation_id])
     await conn.execute(
         f"DELETE FROM {fq_table('memory_units')} WHERE id = $1 AND bank_id = $2 AND fact_type = 'observation'",
         uuid.UUID(observation_id),

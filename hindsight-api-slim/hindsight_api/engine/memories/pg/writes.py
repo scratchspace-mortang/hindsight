@@ -22,6 +22,7 @@ from typing import TYPE_CHECKING, Any
 from ....config import get_config
 from ...document_history import note_observations_removed
 from ..base import StoredMemory
+from .consolidation import SRC_EDIT, _row_version_token, record_change_event, stable_event_id
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from ...retain.types import ProcessedFact
@@ -157,6 +158,19 @@ async def delete_document(*, conn, fq_table: Callable[[str], str], bank_id: str,
     arriving moments later — which the ``document_id``/``bank_id`` predicate
     gives for free inside the caller's transaction.
     """
+    # Change records for the deleted units go with them, named
+    # by document while the rows still exist. Postgres only.
+    from ...schema import _is_oracle  # noqa: PLC0415
+
+    if not _is_oracle():
+        await conn.execute(
+            f"DELETE FROM {fq_table('memory_change_events')} WHERE bank_id = $1 "
+            f"AND subject_id IN (SELECT id FROM {fq_table('memory_units')} WHERE document_id = $2 AND bank_id = $1 "
+            f"UNION SELECT id FROM {fq_table('invalidated_memory_units')} "
+            f"WHERE document_id = $2 AND bank_id = $1)",
+            bank_id,
+            document_id,
+        )
     await conn.execute(
         f"DELETE FROM {fq_table('memory_units')} WHERE document_id = $1 AND bank_id = $2",
         document_id,
@@ -171,6 +185,17 @@ async def delete_observations(*, conn, fq_table: Callable[[str], str], bank_id: 
     ``consolidated_at``) and resetting the bank's consolidation timestamp belong
     to the caller, which owns the bank row.
     """
+    # Change records for the deleted observations go with them.
+    # Postgres only.
+    from ...schema import _is_oracle  # noqa: PLC0415
+
+    if not _is_oracle():
+        await conn.execute(
+            f"DELETE FROM {fq_table('memory_change_events')} WHERE bank_id = $1 "
+            f"AND subject_id IN (SELECT id FROM {fq_table('memory_units')} "
+            f"WHERE bank_id = $1 AND fact_type = 'observation')",
+            bank_id,
+        )
     await conn.execute(
         f"DELETE FROM {fq_table('memory_units')} WHERE bank_id = $1 AND fact_type = 'observation'",
         bank_id,
@@ -310,6 +335,10 @@ async def delete_stale_observations(
         sorted({*fact_uuids, *obs_ids, *remaining_source_ids}),
     )
 
+    # Change records for the deleted observations go with them.
+    from .engine_curation import purge_change_events_for_subjects  # noqa: PLC0415
+
+    await purge_change_events_for_subjects(conn, fq_table, bank_id, obs_ids)
     await conn.execute(
         f"DELETE FROM {fq_table('memory_units')} WHERE id = ANY($1::uuid[])",
         obs_ids,
@@ -435,6 +464,10 @@ async def invalidate_memory(*, conn, fq_table, bank_id: str, unit_id: str, reaso
     from .links import snapshot_causal_links
 
     causal_links = await snapshot_causal_links(conn, bank_id, str(unit_id))
+    # The stored text before the move, for the durable SRC_EDIT record below.
+    live_row = await conn.fetchrow(
+        f"SELECT text, updated_at FROM {mu} WHERE id = $1 AND bank_id = $2", str(unit_id), bank_id
+    )
     inserted = await conn.fetchval(
         f"INSERT INTO {arch} ({arch_cols}, invalidation_reason, invalidated_at, entity_ids, causal_links) "
         f"SELECT {arch_cols}, $2, now(), $3::uuid[], $5::jsonb FROM {mu} WHERE id = $1 AND bank_id = $4 "
@@ -447,6 +480,27 @@ async def invalidate_memory(*, conn, fq_table, bank_id: str, unit_id: str, reaso
     )
     if inserted is None:
         return False
+    # Durable SRC_EDIT record, transactional with the archive move (the model
+    # names one event for edit/refine/supersede/invalidate).
+    await record_change_event(
+        conn=conn,
+        fq_table=fq_table,
+        bank_id=bank_id,
+        subject_id=str(unit_id),
+        event_type=SRC_EDIT,
+        event_id=stable_event_id(
+            bank_id=bank_id,
+            subject_id=str(unit_id),
+            event_type=SRC_EDIT,
+            version_token=_row_version_token(live_row) if live_row is not None else "",
+            before_text=live_row["text"] if live_row is not None else None,
+            after_text=None,
+            detail={"op": "invalidate", "reason": reason, "via": "invalidate_memory"},
+        ),
+        before_text=live_row["text"] if live_row is not None else None,
+        after_text=None,
+        detail={"op": "invalidate", "reason": reason, "via": "invalidate_memory"},
+    )
     # Links in lock order (see delete_unit_links) — after the causal snapshot above reads them.
     from .graph import _ops_for
 
@@ -588,6 +642,14 @@ async def apply_edit(
     # same guard as ``observation_search_vector_expr`` in pg/consolidation.py (#3021).
     from ...schema import _is_oracle
 
+    # The stored text before this edit: the "before" of the durable SRC_EDIT
+    # record (the model names one event for edit, refine, supersede and
+    # invalidate — all of which reach this write path).
+    before = await conn.fetchrow(
+        f"SELECT text, updated_at FROM {mu} WHERE id = $1 AND bank_id = $2", str(unit_id), bank_id
+    )
+    before_text = before["text"] if before is not None else None
+
     sv_expr = None if _is_oracle() else pg_search_vector_expr(get_config(), text_col="$3", context_col="$4")
     sv_clause = f", search_vector = {sv_expr}" if sv_expr else ""
     # The re-embedded vector rides the edit's own UPDATE. It describes the text being written by
@@ -618,6 +680,29 @@ async def apply_edit(
         """,
         *params,
     )
+    # Durable SRC_EDIT record, transactional with the edit. A missing row is a
+    # no-op UPDATE, so it records nothing; an edit that leaves the text alone
+    # still records (metadata, dates and tags are provenance too).
+    if before_text is not None:
+        await record_change_event(
+            conn=conn,
+            fq_table=fq_table,
+            bank_id=bank_id,
+            subject_id=str(unit_id),
+            event_type=SRC_EDIT,
+            event_id=stable_event_id(
+                bank_id=bank_id,
+                subject_id=str(unit_id),
+                event_type=SRC_EDIT,
+                version_token=_row_version_token(before),
+                before_text=before_text,
+                after_text=text,
+                detail={"via": "apply_edit"},
+            ),
+            before_text=before_text,
+            after_text=text,
+            detail={"via": "apply_edit"},
+        )
     # Drop only the DERIVED links — graph maintenance recomputes temporal/semantic. Causal edges
     # are retain-time extraction output that nothing recreates, so an edit preserves them (#2864).
     # In lock order, like every other link delete (see delete_unit_links).

@@ -144,6 +144,19 @@ def _norm_obs_text(text: str) -> str:
     return " ".join((text or "").split()).strip()
 
 
+def compare_text(before: str, after: str) -> bool:
+    """Whether an observation's text changed across a consolidation write.
+
+    The server-side, deterministic verdict for the graph-staleness change
+    records: the model only produces text and is never asked
+    whether the text changed — the worker compares the stored text before
+    the write with the text the model returned. Exact comparison, so a
+    whitespace-only difference counts as a change (a spurious stale mark
+    costs a refresh; a missed change costs a stale page forever).
+    """
+    return before != after
+
+
 def _duplicate_create_target(
     create_text: str,
     shown_obs_by_text: "dict[str, MemoryFact]",

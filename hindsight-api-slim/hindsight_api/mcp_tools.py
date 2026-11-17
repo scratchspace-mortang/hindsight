@@ -139,6 +139,22 @@ class MentalModelTriggerInput(BaseModel):
             "falls back to a full regeneration when there is no existing content or the source_query changed."
         ),
     )
+    staleness_check: Literal["tagscope", "graph"] | None = Field(
+        default=None,
+        description=(
+            "How this model's staleness is decided: 'tagscope' (the default when unset) or 'graph'. "
+            "Graph mode is PostgreSQL-only: on a non-Postgres (Oracle) backend there is no "
+            "change-record table, so a graph-mode model is answered by the tagscope rule there. "
+            "null keeps the stored setting."
+        ),
+    )
+    graph_stale: Literal["cited_memories", "read_memories"] | None = Field(
+        default=None,
+        description=(
+            "Which provenance marks the model stale in graph mode: 'cited_memories' (the default when "
+            "unset) or 'read_memories'. null keeps the stored setting."
+        ),
+    )
     refresh_after_consolidation: bool | None = Field(
         default=None,
         description="Refresh automatically after observations are consolidated. Mutually exclusive with refresh_cron.",
@@ -147,8 +163,10 @@ class MentalModelTriggerInput(BaseModel):
         default=None,
         description=(
             "UTC five-field cron schedule, e.g. '0 3 * * *' for daily at 03:00 UTC. A scheduled refresh runs "
-            "only when the model is stale, so an unchanged scope costs no LLM call. Mutually exclusive with "
-            "refresh_after_consolidation. null = no schedule."
+            "only when the model is stale, so an unchanged scope costs no LLM call. In graph mode staleness "
+            "means a durable change to a provenance memory, not a scope write, so a brand-new memory outside "
+            "provenance never triggers this schedule. "
+            "Mutually exclusive with refresh_after_consolidation. null = no schedule."
         ),
     )
     full_refresh_cron: str | None = Field(
@@ -309,6 +327,13 @@ def _mental_model_trigger_patch(
     of the two silently winning.
     """
     patch = trigger.model_dump(exclude_unset=True) if trigger is not None else {}
+    # An explicit null for the staleness fields means "keep the stored
+    # setting" (their description says so), so it must not overwrite the
+    # stored value with null and read back as the default. Null is dropped for these two fields only: other fields
+    # keep their null-clears semantics.
+    for _staleness_field in ("staleness_check", "graph_stale"):
+        if patch.get(_staleness_field) is None:
+            patch.pop(_staleness_field, None)
     for field, param, legacy_value in (
         ("tags_match", "tags_match", tags_match),
         ("refresh_after_consolidation", "trigger_refresh_after_consolidation", refresh_after_consolidation),
@@ -2779,9 +2804,14 @@ def _register_get_page_tree(mcp: FastMCP, memory: MemoryEngine, config: MCPTools
             group them. Use get_page to read a page's content, or
             search_pages when you know what you are looking for.
 
-            Pages report `is_stale`: false means the page is provably up to date;
-            true means something was written since its last refresh, so it MAY be
-            out of date.
+            Pages report `is_stale`: false means the page is up to date on
+            everything the check can see; true means something changed since
+            its last refresh — a write in its scope, a change to a memory it
+            was built from, or the deletion of such a memory — so it MAY be
+            out of date. In graph mode the rule is the provenance baseline
+            instead of the scope: a brand-new memory outside every provenance
+            observation never raises this flag, so false does not rule out new
+            memories the page never read.
 
             Args:
                 bank_id: Optional bank (defaults to session bank). Use for cross-bank operations.
@@ -2806,9 +2836,14 @@ def _register_get_page_tree(mcp: FastMCP, memory: MemoryEngine, config: MCPTools
             group them. Use get_page to read a page's content, or
             search_pages when you know what you are looking for.
 
-            Pages report `is_stale`: false means the page is provably up to date;
-            true means something was written since its last refresh, so it MAY be
-            out of date.
+            Pages report `is_stale`: false means the page is up to date on
+            everything the check can see; true means something changed since
+            its last refresh — a write in its scope, a change to a memory it
+            was built from, or the deletion of such a memory — so it MAY be
+            out of date. In graph mode the rule is the provenance baseline
+            instead of the scope: a brand-new memory outside every provenance
+            observation never raises this flag, so false does not rule out new
+            memories the page never read.
             """
             return await _run_tool(
                 config,

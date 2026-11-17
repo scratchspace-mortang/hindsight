@@ -629,6 +629,8 @@ class TestPageDefaults:
             "fact_types": ["observation"],
             "exclude_mental_models": True,
             "refresh_after_consolidation": True,
+            "staleness_check": "tagscope",
+            "graph_stale": "cited_memories",
         }
         assert mm["max_tokens"] == 4096
         await memory.delete_bank(bank_id, request_context=request_context)
@@ -673,6 +675,8 @@ class TestPageDefaults:
             "fact_types": ["world", "experience", "observation"],
             "exclude_mental_models": True,
             "refresh_after_consolidation": True,
+            "staleness_check": "tagscope",
+            "graph_stale": "cited_memories",
         }
         await memory.delete_bank(bank_id, request_context=request_context)
 

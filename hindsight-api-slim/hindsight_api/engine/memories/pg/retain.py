@@ -236,6 +236,13 @@ async def delete_document_for_replace(
     if ops is not None:
         await ops.delete_unit_links(conn, fq_table("memory_links"), bank_id, outgoing_unit_ids)
 
+    # Change records for the outgoing facts go with them: a
+    # re-ingest deletes the old facts and mints new ids, so any record left
+    # behind names a subject that no longer exists.
+    from .engine_curation import purge_change_events_for_subjects  # noqa: PLC0415
+
+    await purge_change_events_for_subjects(conn, fq_table, bank_id, outgoing_unit_ids)
+
     # Explicitly delete memory_units by document_id BEFORE deleting the
     # document row. The CASCADE from documents→chunks→memory_units only
     # catches units that have a non-NULL chunk_id FK. Units with chunk_id=NULL

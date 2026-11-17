@@ -80,6 +80,10 @@ _REPLAYED_TABLES = frozenset(
         # There is no stable observation id to re-attach history to, so it is not
         # carried; the target rebuilds observation history as it re-consolidates.
         "observation_history",
+        # memory_change_events subjects are the same derived observations, and
+        # its bank baselines reference provenance the replay regenerates; the
+        # target rebuilds change records as it re-consolidates.
+        "memory_change_events",
     }
 )
 # Carried verbatim as JSON rows (bank config + synthesized state). Embedding-bearing

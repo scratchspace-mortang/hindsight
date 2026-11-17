@@ -22,6 +22,10 @@ type MentalModelTriggerInput struct {
 	Budget NullableBudget `json:"budget,omitempty"`
 	// Refresh mode. 'full' (default) regenerates the mental model content from scratch on each refresh. 'delta' performs surgical edits against the existing content: unchanged sections are preserved byte-for-byte, stale content is removed, new content is added. If the mental model has no existing content, or if the source_query has changed since the last refresh, delta mode falls back to a full regeneration automatically.
 	Mode *string `json:"mode,omitempty"`
+	// How this model's staleness is decided. 'tagscope' (default) uses the scope-plus-watermark check; 'graph' uses provenance (the memories the model was built from). When the field is absent it reads back as 'tagscope'. Graph mode is PostgreSQL-only: on a non-Postgres (Oracle) backend there is no change-record table, so a graph-mode model is answered by the tagscope rule there.
+	StalenessCheck *string `json:"staleness_check,omitempty"`
+	// Which provenance marks the model stale in graph mode: 'cited_memories' (default) or 'read_memories'. Only meaningful when staleness_check is 'graph'. When the field is absent it reads back as 'cited_memories'.
+	GraphStale *string `json:"graph_stale,omitempty"`
 	// If true, refresh this mental model after observations consolidation (real-time mode)
 	RefreshAfterConsolidation *bool `json:"refresh_after_consolidation,omitempty"`
 	RefreshCron NullableString `json:"refresh_cron,omitempty"`
@@ -51,6 +55,10 @@ func NewMentalModelTriggerInput() *MentalModelTriggerInput {
 	this := MentalModelTriggerInput{}
 	var mode string = "full"
 	this.Mode = &mode
+	var stalenessCheck string = "tagscope"
+	this.StalenessCheck = &stalenessCheck
+	var graphStale string = "cited_memories"
+	this.GraphStale = &graphStale
 	var refreshAfterConsolidation bool = false
 	this.RefreshAfterConsolidation = &refreshAfterConsolidation
 	var excludeMentalModels bool = false
@@ -67,6 +75,10 @@ func NewMentalModelTriggerInputWithDefaults() *MentalModelTriggerInput {
 	this := MentalModelTriggerInput{}
 	var mode string = "full"
 	this.Mode = &mode
+	var stalenessCheck string = "tagscope"
+	this.StalenessCheck = &stalenessCheck
+	var graphStale string = "cited_memories"
+	this.GraphStale = &graphStale
 	var refreshAfterConsolidation bool = false
 	this.RefreshAfterConsolidation = &refreshAfterConsolidation
 	var excludeMentalModels bool = false
@@ -148,6 +160,70 @@ func (o *MentalModelTriggerInput) HasMode() bool {
 // SetMode gets a reference to the given string and assigns it to the Mode field.
 func (o *MentalModelTriggerInput) SetMode(v string) {
 	o.Mode = &v
+}
+
+// GetStalenessCheck returns the StalenessCheck field value if set, zero value otherwise.
+func (o *MentalModelTriggerInput) GetStalenessCheck() string {
+	if o == nil || IsNil(o.StalenessCheck) {
+		var ret string
+		return ret
+	}
+	return *o.StalenessCheck
+}
+
+// GetStalenessCheckOk returns a tuple with the StalenessCheck field value if set, nil otherwise
+// and a boolean to check if the value has been set.
+func (o *MentalModelTriggerInput) GetStalenessCheckOk() (*string, bool) {
+	if o == nil || IsNil(o.StalenessCheck) {
+		return nil, false
+	}
+	return o.StalenessCheck, true
+}
+
+// HasStalenessCheck returns a boolean if a field has been set.
+func (o *MentalModelTriggerInput) HasStalenessCheck() bool {
+	if o != nil && !IsNil(o.StalenessCheck) {
+		return true
+	}
+
+	return false
+}
+
+// SetStalenessCheck gets a reference to the given string and assigns it to the StalenessCheck field.
+func (o *MentalModelTriggerInput) SetStalenessCheck(v string) {
+	o.StalenessCheck = &v
+}
+
+// GetGraphStale returns the GraphStale field value if set, zero value otherwise.
+func (o *MentalModelTriggerInput) GetGraphStale() string {
+	if o == nil || IsNil(o.GraphStale) {
+		var ret string
+		return ret
+	}
+	return *o.GraphStale
+}
+
+// GetGraphStaleOk returns a tuple with the GraphStale field value if set, nil otherwise
+// and a boolean to check if the value has been set.
+func (o *MentalModelTriggerInput) GetGraphStaleOk() (*string, bool) {
+	if o == nil || IsNil(o.GraphStale) {
+		return nil, false
+	}
+	return o.GraphStale, true
+}
+
+// HasGraphStale returns a boolean if a field has been set.
+func (o *MentalModelTriggerInput) HasGraphStale() bool {
+	if o != nil && !IsNil(o.GraphStale) {
+		return true
+	}
+
+	return false
+}
+
+// SetGraphStale gets a reference to the given string and assigns it to the GraphStale field.
+func (o *MentalModelTriggerInput) SetGraphStale(v string) {
+	o.GraphStale = &v
 }
 
 // GetRefreshAfterConsolidation returns the RefreshAfterConsolidation field value if set, zero value otherwise.
@@ -771,6 +847,12 @@ func (o MentalModelTriggerInput) ToMap() (map[string]interface{}, error) {
 	}
 	if !IsNil(o.Mode) {
 		toSerialize["mode"] = o.Mode
+	}
+	if !IsNil(o.StalenessCheck) {
+		toSerialize["staleness_check"] = o.StalenessCheck
+	}
+	if !IsNil(o.GraphStale) {
+		toSerialize["graph_stale"] = o.GraphStale
 	}
 	if !IsNil(o.RefreshAfterConsolidation) {
 		toSerialize["refresh_after_consolidation"] = o.RefreshAfterConsolidation

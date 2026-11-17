@@ -71,6 +71,9 @@ BACKUP_TABLES = [
     "entities",
     "chunks",
     "memory_units",
+    # Graph-staleness durable change records; bank_id only (no FK), restored
+    # with the memory units whose changes it describes.
+    "memory_change_events",
     "invalidated_memory_units",
     "unit_entities",
     "entity_cooccurrences",

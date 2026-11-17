@@ -8321,6 +8321,7 @@ components:
           exclude_mental_models: false
           mode: full
           refresh_after_consolidation: false
+          graph_stale: cited_memories
           full_refresh_cron: full_refresh_cron
           fact_types:
           - world
@@ -8335,6 +8336,7 @@ components:
           tags_match: any
           min_refresh_interval_seconds: 0
           keep_trace: false
+          staleness_check: tagscope
           budget: low
           recall_max_tokens: 1
         tags:
@@ -11155,6 +11157,7 @@ components:
             exclude_mental_models: false
             mode: full
             refresh_after_consolidation: false
+            graph_stale: cited_memories
             full_refresh_cron: full_refresh_cron
             fact_types:
             - world
@@ -11169,6 +11172,7 @@ components:
             tags_match: any
             min_refresh_interval_seconds: 0
             keep_trace: false
+            staleness_check: tagscope
             budget: low
             recall_max_tokens: 1
           last_refreshed_at: last_refreshed_at
@@ -11208,6 +11212,7 @@ components:
             exclude_mental_models: false
             mode: full
             refresh_after_consolidation: false
+            graph_stale: cited_memories
             full_refresh_cron: full_refresh_cron
             fact_types:
             - world
@@ -11222,6 +11227,7 @@ components:
             tags_match: any
             min_refresh_interval_seconds: 0
             keep_trace: false
+            staleness_check: tagscope
             budget: low
             recall_max_tokens: 1
           last_refreshed_at: last_refreshed_at
@@ -11427,6 +11433,7 @@ components:
           exclude_mental_models: false
           mode: full
           refresh_after_consolidation: false
+          graph_stale: cited_memories
           full_refresh_cron: full_refresh_cron
           fact_types:
           - world
@@ -11441,6 +11448,7 @@ components:
           tags_match: any
           min_refresh_interval_seconds: 0
           keep_trace: false
+          staleness_check: tagscope
           budget: low
           recall_max_tokens: 1
         last_refreshed_at: last_refreshed_at
@@ -11629,6 +11637,7 @@ components:
         exclude_mental_models: false
         mode: full
         refresh_after_consolidation: false
+        graph_stale: cited_memories
         full_refresh_cron: full_refresh_cron
         fact_types:
         - world
@@ -11643,6 +11652,7 @@ components:
         tags_match: any
         min_refresh_interval_seconds: 0
         keep_trace: false
+        staleness_check: tagscope
         budget: low
         recall_max_tokens: 1
       properties:
@@ -11660,6 +11670,29 @@ components:
           - full
           - delta
           title: Mode
+          type: string
+        staleness_check:
+          default: tagscope
+          description: "How this model's staleness is decided. 'tagscope' (default)\
+            \ uses the scope-plus-watermark check; 'graph' uses provenance (the memories\
+            \ the model was built from). When the field is absent it reads back as\
+            \ 'tagscope'. Graph mode is PostgreSQL-only: on a non-Postgres (Oracle)\
+            \ backend there is no change-record table, so a graph-mode model is answered\
+            \ by the tagscope rule there."
+          enum:
+          - tagscope
+          - graph
+          title: Staleness Check
+          type: string
+        graph_stale:
+          default: cited_memories
+          description: "Which provenance marks the model stale in graph mode: 'cited_memories'\
+            \ (default) or 'read_memories'. Only meaningful when staleness_check is\
+            \ 'graph'. When the field is absent it reads back as 'cited_memories'."
+          enum:
+          - cited_memories
+          - read_memories
+          title: Graph Stale
           type: string
         refresh_after_consolidation:
           default: false
@@ -11772,6 +11805,7 @@ components:
         exclude_mental_models: false
         mode: full
         refresh_after_consolidation: false
+        graph_stale: cited_memories
         full_refresh_cron: full_refresh_cron
         fact_types:
         - world
@@ -11786,6 +11820,7 @@ components:
         tags_match: any
         min_refresh_interval_seconds: 0
         keep_trace: false
+        staleness_check: tagscope
         budget: low
         recall_max_tokens: 1
       properties:
@@ -11803,6 +11838,29 @@ components:
           - full
           - delta
           title: Mode
+          type: string
+        staleness_check:
+          default: tagscope
+          description: "How this model's staleness is decided. 'tagscope' (default)\
+            \ uses the scope-plus-watermark check; 'graph' uses provenance (the memories\
+            \ the model was built from). When the field is absent it reads back as\
+            \ 'tagscope'. Graph mode is PostgreSQL-only: on a non-Postgres (Oracle)\
+            \ backend there is no change-record table, so a graph-mode model is answered\
+            \ by the tagscope rule there."
+          enum:
+          - tagscope
+          - graph
+          title: Staleness Check
+          type: string
+        graph_stale:
+          default: cited_memories
+          description: "Which provenance marks the model stale in graph mode: 'cited_memories'\
+            \ (default) or 'read_memories'. Only meaningful when staleness_check is\
+            \ 'graph'. When the field is absent it reads back as 'cited_memories'."
+          enum:
+          - cited_memories
+          - read_memories
+          title: Graph Stale
           type: string
         refresh_after_consolidation:
           default: false
@@ -14520,6 +14578,7 @@ components:
           exclude_mental_models: false
           mode: full
           refresh_after_consolidation: false
+          graph_stale: cited_memories
           full_refresh_cron: full_refresh_cron
           fact_types:
           - world
@@ -14534,6 +14593,7 @@ components:
           tags_match: any
           min_refresh_interval_seconds: 0
           keep_trace: false
+          staleness_check: tagscope
           budget: low
           recall_max_tokens: 1
         tags:

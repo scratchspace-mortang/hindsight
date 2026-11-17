@@ -382,6 +382,8 @@ you can also configure from an agent over MCP.
 | `refresh_cron` | string | UTC five-field cron, e.g. `0 3 * * *` for daily at 03:00 UTC. Only runs when the model is stale, so an unchanged scope costs no LLM call |
 | `full_refresh_cron` | string | UTC five-field cron for a scheduled **full** refresh of a delta model, e.g. `0 3 * * 0`. Independent of the two triggers above; skipped when no refresh ran since the last full one |
 | `min_refresh_interval_seconds` | integer | Floor between two *automatic* refreshes. Triggers arriving sooner fold into one queued refresh, so a burst of retains costs one rebuild. Explicit refreshes ignore it |
+| `staleness_check` | string | How staleness is decided: `tagscope` (default, scope-plus-watermark) or `graph` (provenance baseline). See the mental-models reference |
+| `graph_stale` | string | Which provenance marks the model stale in graph mode: `cited_memories` (default) or `read_memories`. Only meaningful when `staleness_check` is `graph` |
 | `fact_types` | list[string] | Which of `world`, `experience`, `observation` the refresh retrieves. Omit for all three |
 | `exclude_mental_models` | boolean | Exclude **all** mental models from the refresh, so a model never reflects on its siblings |
 | `exclude_mental_model_ids` | list[string] | Exclude specific mental models by ID |
@@ -677,7 +679,7 @@ Clear all memories from a bank without deleting the bank itself. Optionally filt
 
 ### get_page_tree
 
-Browse the bank's pages as a nested tree of folders and pages. Each page reports `is_stale`: `false` means it is provably up to date, `true` means the bank has been written to since the page last refreshed.
+Browse the bank's pages as a nested tree of folders and pages. Each page reports `is_stale`: `false` means it is provably up to date, `true` means the bank has been written to since the page last refreshed, or a memory the page cites was deleted (in both modes), or a provenance memory changed or was deleted (in graph mode). In graph mode a brand-new memory outside every provenance observation never raises this flag, so `false` does not rule out new memories the page never read.
 
 ---
 

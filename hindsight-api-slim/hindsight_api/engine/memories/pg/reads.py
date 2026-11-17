@@ -40,7 +40,7 @@ from ...search.tags import (
     build_tags_where_clause_simple,
     tag_clause_is_index_only,
 )
-from ..base import MemoryScopeWatermark, ScanPage, StoredMemory
+from ..base import MemoryScopeWatermark, ProvenanceBatch, ScanPage, StoredMemory
 
 # The `memory_units` projection every read here shares. Superset of the by-id
 # SELECT the recall source-facts path used (text/fact_type/context/timestamps/
@@ -960,6 +960,191 @@ async def live_memory_ids(
     return {str(row["id"]) for row in rows}
 
 
+async def provenance_batch_read(
+    *,
+    conn,
+    fq_table: Callable[[str], str],
+    bank_id: str,
+    page_ids: list[str],
+) -> dict[str, ProvenanceBatch]:
+    """Per-page provenance facts for the batched staleness decision.
+
+    Returns, per page key, the cited ids (``based_on``), the read ids
+    (the persisted per-refresh read set), the observation sources
+    expanded one hop through the live observations each set names, the
+    stored change signal (newest change-record seq per live subject),
+    the page's trigger and provenance stamps, and which cited/read ids
+    are still live. Expansion stops at the observation's own sources:
+    memory-to-memory edges are never traversed, so a source of a source
+    is not provenance.
+
+    The read is a constant number of statements per batch — the page
+    rows, the provenance units, the change records, each once — never
+    a query per page (no N+1). Page keys are whatever the caller keys
+    answers by: a mental-model id resolves directly, a knowledge-page
+    id resolves through its ``mental_model_id``. Pages that resolve to
+    no mental-model row are absent from the result; the caller decides
+    their verdict.
+
+    Postgres only. The change-record table exists only there (its
+    migration runs for pg), so another backend answers {} — the caller
+    keeps its legacy answers, exactly as
+    :func:`any_memory_updated_since_batch` keeps its per-scope path.
+    """
+    from ...reflect.retractions import based_on_fact_ids  # noqa: PLC0415
+
+    if getattr(conn, "backend_type", "postgresql") != "postgresql":
+        return {}
+    pages = [str(page_id) for page_id in page_ids or []]
+    if not pages:
+        return {}
+
+    mm_table = fq_table("mental_models")
+    kp_table = fq_table("knowledge_pages")
+
+    # Page rows: mental-model ids first, knowledge-page ids through the
+    # kp join for whatever did not resolve. Ids compare as text, so a
+    # key that is not a UUID — or is a knowledge-page id — never fails
+    # the batch.
+    resolved: dict[str, tuple[Any, Any]] = {}
+    rows = await conn.fetch(
+        f"SELECT id::text AS page_id, trigger, reflect_response FROM {mm_table} "
+        f"WHERE bank_id = $1 AND id::text = ANY($2::text[])",
+        bank_id,
+        pages,
+    )
+    for row in rows:
+        resolved[str(row["page_id"])] = (row["trigger"], row["reflect_response"])
+    leftover = [page_id for page_id in pages if page_id not in resolved]
+    if leftover:
+        rows = await conn.fetch(
+            f"SELECT kp.id AS page_id, mm.trigger AS trigger, mm.reflect_response AS reflect_response "
+            f"FROM {kp_table} kp "
+            f"JOIN {mm_table} mm ON mm.bank_id = kp.bank_id AND mm.id::text = kp.mental_model_id "
+            f"WHERE kp.bank_id = $1 AND kp.id = ANY($2::text[])",
+            bank_id,
+            leftover,
+        )
+        for row in rows:
+            resolved.setdefault(str(row["page_id"]), (row["trigger"], row["reflect_response"]))
+
+    # Provenance ids per page, split by traversal set before any query:
+    # the engine takes the max signal per mode, so the two sets stay
+    # separate here.
+    per_page: dict[str, tuple[list[str], list[str] | None, Any, Any]] = {}
+    all_provenance: list[uuid.UUID] = []
+    for page_id in resolved:
+        trigger, reflect_response = resolved[page_id]
+        parsed = _as_json(reflect_response)
+        parsed = parsed if isinstance(parsed, dict) else {}
+        based_on = parsed.get("based_on")
+        cited_ids = based_on_fact_ids(based_on)
+        prov = parsed.get("graph_provenance")
+        prov = prov if isinstance(prov, dict) else None
+        read_ids: list[str] | None = None
+        captured_empty = bool(prov.get("captured_empty")) if prov else False
+        # The cited set's own empty marker, falling
+        # back to the read marker on stamps that predate it.
+        cited_empty = bool(prov.get("cited_empty", captured_empty)) if prov else False
+        baseline_seq: int | None = None
+        if prov is not None:
+            raw_read_ids = prov.get("read_memory_ids")
+            if isinstance(raw_read_ids, list):
+                read_ids = [str(x) for x in raw_read_ids]
+            baseline = prov.get("baseline_seq")
+            if isinstance(baseline, int):
+                baseline_seq = baseline
+        trigger_raw = resolved[page_id][0]
+        trigger_parsed = _as_json(trigger_raw)
+        trigger_parsed = trigger_parsed if isinstance(trigger_parsed, dict) else {}
+        is_graph = trigger_parsed.get("staleness_check") == "graph"
+        per_page[page_id] = (
+            cited_ids,
+            read_ids,
+            based_on is not None,
+            (captured_empty, baseline_seq, cited_empty, is_graph),
+        )
+        all_provenance.extend(_as_uuids(cited_ids))
+        if read_ids:
+            all_provenance.extend(_as_uuids(read_ids))
+
+    live: dict[str, dict[str, Any]] = {}
+    cited_sources: dict[str, list[str]] = {}
+    read_sources: dict[str, list[str]] = {}
+    change_seqs: dict[str, int] = {}
+    if all_provenance:
+        unit_rows = await conn.fetch(
+            f"SELECT id, fact_type, source_memory_ids FROM {fq_table('memory_units')} "
+            f"WHERE bank_id = $1 AND id = ANY($2::uuid[])",
+            bank_id,
+            all_provenance,
+        )
+        by_id = {str(row["id"]): row for row in unit_rows}
+        for page_id, (cited_ids, read_ids, _, _) in per_page.items():
+            live_cited = [fact_id for fact_id in cited_ids if str(fact_id) in by_id]
+            live_read = [fact_id for fact_id in (read_ids or []) if str(fact_id) in by_id]
+            for label, chosen in (("c", live_cited), ("r", live_read)):
+                out: list[str] = []
+                seen: set[str] = set()
+                for unit_id in chosen:
+                    row = by_id.get(str(unit_id))
+                    if row is None or row["fact_type"] != "observation":
+                        continue
+                    for source_id in row["source_memory_ids"] or []:
+                        text_id = str(source_id)
+                        if text_id not in seen:
+                            seen.add(text_id)
+                            out.append(text_id)
+                (cited_sources if label == "c" else read_sources)[page_id] = out
+            live[page_id] = {"c": live_cited, "r": live_read}
+
+        # The change-record query is graph-only: tagscope pages answer by
+        # liveness (already resolved above) and must not pay for it, so a
+        # batch with no graph page issues no change-record statement at all
+        #. Subjects come from graph pages only.
+        graph_pages = [pid for pid, (_, _, _, (_, _, _, is_graph)) in per_page.items() if is_graph]
+        if graph_pages:
+            subjects: list[uuid.UUID] = []
+            for pid in graph_pages:
+                cited_ids, read_ids, _, _ = per_page[pid]
+                subjects.extend(_as_uuids(cited_ids))
+                if read_ids:
+                    subjects.extend(_as_uuids(read_ids))
+                subjects.extend(_as_uuids(cited_sources.get(pid, [])))
+                subjects.extend(_as_uuids(read_sources.get(pid, [])))
+            event_rows = await conn.fetch(
+                f"SELECT subject_id, MAX(seq) AS max_seq FROM {fq_table('memory_change_events')} "
+                f"WHERE bank_id = $1 AND subject_id = ANY($2::uuid[]) GROUP BY subject_id",
+                bank_id,
+                subjects,
+            )
+            change_seqs = {str(row["subject_id"]): int(row["max_seq"]) for row in event_rows}
+
+    out: dict[str, ProvenanceBatch] = {}
+    for page_id, (
+        cited_ids,
+        read_ids,
+        based_on_present,
+        (captured_empty, baseline_seq, cited_empty, _),
+    ) in per_page.items():
+        out[page_id] = ProvenanceBatch(
+            page_id=page_id,
+            trigger=resolved[page_id][0],
+            cited_ids=list(cited_ids),
+            based_on_present=based_on_present,
+            read_ids=read_ids,
+            captured_empty=captured_empty,
+            baseline_seq=baseline_seq,
+            cited_source_ids=cited_sources.get(page_id, []),
+            read_source_ids=read_sources.get(page_id, []),
+            live_cited_ids=live.get(page_id, {}).get("c", []),
+            live_read_ids=live.get(page_id, {}).get("r", []),
+            change_seqs=change_seqs,
+            cited_empty=cited_empty,
+        )
+    return out
+
+
 __all__ = [
     "any_memory_updated_since",
     "any_memory_updated_since_batch",
@@ -970,5 +1155,6 @@ __all__ = [
     "list_tags",
     "live_memory_ids",
     "mark_consolidated",
+    "provenance_batch_read",
     "scan_memories",
 ]

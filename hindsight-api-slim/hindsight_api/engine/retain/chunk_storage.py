@@ -70,6 +70,8 @@ async def delete_chunks_by_ids(conn, chunk_ids: list[str], bank_id: str, ops=Non
     # instead, which is why the sweep has to live here rather than at one of the call sites.
     invalidated = 0
     outgoing_unit_ids = await memory_ids_for_chunks(conn, bank_id, chunk_ids)
+    from ..memories import get_memories
+
     if outgoing_unit_ids:
         from ..graph_maintenance import enqueue_entity_prune_candidates
         from .fact_storage import delete_stale_observations_for_memories
@@ -81,6 +83,14 @@ async def delete_chunks_by_ids(conn, chunk_ids: list[str], bank_id: str, ops=Non
         # through this cascade, so this is the one place that can catch them
         # (the full-replace path enqueues in ``handle_document_tracking``).
         await enqueue_entity_prune_candidates(conn, bank_id, outgoing_unit_ids)
+
+        # Change records for the outgoing facts go with them: records must not
+        # outlive their subject — the cascade below deletes the fact rows without
+        # touching the record table, whose rows carry no cascading FK. Oracle-gated
+        # inside the store method.
+        await get_memories().purge_change_events_for_subjects(
+            conn=conn, fq_table=fq_table, bank_id=bank_id, unit_ids=outgoing_unit_ids
+        )
 
         # Capture surviving units whose temporal/semantic links point at
         # the outgoing facts before the link/chunk cascade below removes
@@ -96,8 +106,6 @@ async def delete_chunks_by_ids(conn, chunk_ids: list[str], bank_id: str, ops=Non
     # in a total order; a store that keeps memories outside SQL (where no FK cascade reaches them)
     # drops the memories carrying each chunk_id — otherwise a delta re-ingest leaves the old ones
     # as duplicates.
-    from ..memories import get_memories
-
     await get_memories().delete_chunks(conn=conn, fq_table=fq_table, bank_id=bank_id, chunk_ids=chunk_ids)
     return invalidated
 

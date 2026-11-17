@@ -88,7 +88,16 @@ _API_ROOT = Path(__file__).resolve().parents[1] / "hindsight_api"
 
 # migrations.py holds a grandfathered advisory lock (tracked for removal, see
 # CLAUDE.md); it runs on its own connection, not a pooled one.
-_ADVISORY_LOCK_ALLOWED = {_API_ROOT / "migrations.py"}
+# pg/consolidation.py and memory_engine.py take pg_advisory_xact_lock (the
+# graph-staleness commit-order lock): transaction-scoped, so it is released at
+# COMMIT/ROLLBACK — including the ROLLBACK asyncpg's release performs on a
+# pooled connection — and cannot leak to the next acquirer the way
+# session-scoped locks can.
+_ADVISORY_LOCK_ALLOWED = {
+    _API_ROOT / "migrations.py",
+    _API_ROOT / "engine" / "memories" / "pg" / "consolidation.py",
+    _API_ROOT / "engine" / "memory_engine.py",
+}
 
 # The pool's own session GUCs (this is the state the reset used to wipe and the
 # per-acquire setup used to re-send) plus extension bootstrap, which runs on a

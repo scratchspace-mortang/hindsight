@@ -119,6 +119,15 @@ class PostgresConnection(DatabaseConnection):
             if outermost:
                 self._before_commit.clear()
 
+    def in_transaction(self) -> bool:
+        """Whether this connection has an open transaction.
+
+        asyncpg names the probe ``is_in_transaction``; the store's
+        transaction guard reads ``in_transaction``, so the wrapper exposes it
+        under that name. A stub connection for tests answers the same way.
+        """
+        return self._conn.is_in_transaction()
+
     async def execute(self, query: str, *args: Any, timeout: float | None = None) -> str:
         # asyncpg's stubs declare `timeout: float`; None is its documented "no timeout", and
         # every method on this class passes it straight through.

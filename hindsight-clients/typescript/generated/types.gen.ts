@@ -530,7 +530,7 @@ export type BankStatsResponse = {
   /**
    * Last Memory Write At
    *
-   * When a memory was last written in this bank — stored, edited, or consolidated (ISO format). Null if the bank has no memories. A mental model whose `last_memory_seen_at` is at or after this is up to date whatever its tags; an older one may need a refresh, which only the single mental-model read can confirm.
+   * When a memory was last written in this bank — stored, edited, or consolidated (ISO format). Null if the bank has no memories. A mental model whose `last_memory_seen_at` is at or after this is up to date whatever its tags, in tagscope mode — with one exception: it cites a memory that has since been deleted, which raises no write and marks it stale anyway (see `is_stale`). An older one may need a refresh, which only the single mental-model read can confirm. In graph mode staleness follows the provenance baseline instead of the scope, so `is_stale` decides.
    */
   last_memory_write_at?: string | null;
   /**
@@ -3629,7 +3629,12 @@ export type LlmOperationHealth = {
    *
    * 'connected'; 'not_configured' (provider is 'none'); 'auth_failed' (rejected — usually a wrong/expired API key); 'unreachable' (call failed); 'timeout'
    */
-  status: "connected" | "not_configured" | "auth_failed" | "unreachable" | "timeout";
+  status:
+    | "connected"
+    | "not_configured"
+    | "auth_failed"
+    | "unreachable"
+    | "timeout";
   /**
    * Latency Ms
    *
@@ -4634,7 +4639,7 @@ export type MentalModelResponse = {
   /**
    * Last Memory Seen At
    *
-   * How far through the bank's memories this model is written — the newest in-scope memory the last refresh saw, in ISO format. Stands still when nothing in the model's scope has been written, however often it is refreshed. At or after the bank's `last_memory_write_at` (GET /stats) the model is provably up to date; when it is older, `is_stale` settles it against the model's own scope. Null for a model no refresh has stamped yet.
+   * How far through the bank's memories this model is written — the newest in-scope memory the last refresh saw, in ISO format. Stands still when nothing in the model's scope has been written, however often it is refreshed. At or after the bank's `last_memory_write_at` (GET /stats) the model is up to date in tagscope mode — with one exception: it cites a memory that has since been deleted, which raises no write and marks it stale anyway (see `is_stale`); in graph mode staleness follows the provenance baseline instead of the scope, so `is_stale` decides. When it is older, `is_stale` settles it against the model's own scope. Null for a model no refresh has stamped yet.
    */
   last_memory_seen_at?: string | null;
   /**
@@ -4678,7 +4683,7 @@ export type MentalModelResponse = {
   /**
    * Is Stale
    *
-   * True when memories matching this mental model's tag/fact_type scope have been written since last_memory_seen_at — the same check that decides whether a scheduled refresh does any work, so a model flagged here is one a refresh would actually rewrite. Populated on both the single read and the list. Deletions are not observed: removing an in-scope memory leaves no write behind, so it does not raise this flag.
+   * True when memories matching this mental model's tag/fact_type scope have been written since last_memory_seen_at — the same check that decides whether a scheduled refresh does any work, so a model flagged here is one a refresh would actually rewrite. Populated on both the single read and the list. Deleting a memory this model was built from also raises this flag in both modes (removing a cited memory leaves no write behind, so it is asked separately); in graph mode a change to a provenance memory raises it too. In graph mode the rule is the provenance baseline instead of the scope: a brand-new memory outside every provenance observation never raises this flag. Deleting a memory the model never cited or read does not.
    */
   is_stale?: boolean | null;
 };
@@ -4816,6 +4821,18 @@ export type MentalModelTriggerInput = {
    */
   mode?: "full" | "delta";
   /**
+   * Staleness Check
+   *
+   * How this model's staleness is decided. 'tagscope' (default) uses the scope-plus-watermark check; 'graph' uses provenance (the memories the model was built from). When the field is absent it reads back as 'tagscope'. Graph mode is PostgreSQL-only: on a non-Postgres (Oracle) backend there is no change-record table, so a graph-mode model is answered by the tagscope rule there.
+   */
+  staleness_check?: "tagscope" | "graph";
+  /**
+   * Graph Stale
+   *
+   * Which provenance marks the model stale in graph mode: 'cited_memories' (default) or 'read_memories'. Only meaningful when staleness_check is 'graph'. When the field is absent it reads back as 'cited_memories'.
+   */
+  graph_stale?: "cited_memories" | "read_memories";
+  /**
    * Refresh After Consolidation
    *
    * If true, refresh this mental model after observations consolidation (real-time mode)
@@ -4824,7 +4841,7 @@ export type MentalModelTriggerInput = {
   /**
    * Refresh Cron
    *
-   * Cron expression (UTC, standard 5-field syntax, e.g. '0 3 * * *' for daily at 03:00 UTC) for refreshing this mental model on a fixed schedule. Mutually exclusive with refresh_after_consolidation — a model refreshes either after consolidation or on a cron schedule, not both. A scheduled refresh only runs when the model is stale (new memories in its scope since the last refresh); if nothing changed, the tick is skipped to avoid a wasted LLM call. null = no schedule.
+   * Cron expression (UTC, standard 5-field syntax, e.g. '0 3 * * *' for daily at 03:00 UTC) for refreshing this mental model on a fixed schedule. Mutually exclusive with refresh_after_consolidation — a model refreshes either after consolidation or on a cron schedule, not both. A scheduled refresh only runs when the model is stale (new memories in its scope since the last refresh); if nothing changed, the tick is skipped to avoid a wasted LLM call. In graph mode staleness means a durable change to a provenance memory, not a scope write, so a brand-new memory outside provenance never triggers this schedule. null = no schedule.
    */
   refresh_cron?: string | null;
   /**
@@ -4868,7 +4885,9 @@ export type MentalModelTriggerInput = {
    *
    * Compound boolean tag expressions to use during refresh instead of the model's own tags. When set, these tag groups are passed to reflect and the model's flat tags are NOT used for filtering. Supports nested and/or/not expressions for complex tag-based scoping.
    */
-  tag_groups?: Array<TagGroupLeaf | TagGroupAndInput | TagGroupOrInput | TagGroupNotInput> | null;
+  tag_groups?: Array<
+    TagGroupLeaf | TagGroupAndInput | TagGroupOrInput | TagGroupNotInput
+  > | null;
   /**
    * Include Chunks
    *
@@ -4939,6 +4958,18 @@ export type MentalModelTriggerOutput = {
    */
   mode?: "full" | "delta";
   /**
+   * Staleness Check
+   *
+   * How this model's staleness is decided. 'tagscope' (default) uses the scope-plus-watermark check; 'graph' uses provenance (the memories the model was built from). When the field is absent it reads back as 'tagscope'. Graph mode is PostgreSQL-only: on a non-Postgres (Oracle) backend there is no change-record table, so a graph-mode model is answered by the tagscope rule there.
+   */
+  staleness_check?: "tagscope" | "graph";
+  /**
+   * Graph Stale
+   *
+   * Which provenance marks the model stale in graph mode: 'cited_memories' (default) or 'read_memories'. Only meaningful when staleness_check is 'graph'. When the field is absent it reads back as 'cited_memories'.
+   */
+  graph_stale?: "cited_memories" | "read_memories";
+  /**
    * Refresh After Consolidation
    *
    * If true, refresh this mental model after observations consolidation (real-time mode)
@@ -4947,7 +4978,7 @@ export type MentalModelTriggerOutput = {
   /**
    * Refresh Cron
    *
-   * Cron expression (UTC, standard 5-field syntax, e.g. '0 3 * * *' for daily at 03:00 UTC) for refreshing this mental model on a fixed schedule. Mutually exclusive with refresh_after_consolidation — a model refreshes either after consolidation or on a cron schedule, not both. A scheduled refresh only runs when the model is stale (new memories in its scope since the last refresh); if nothing changed, the tick is skipped to avoid a wasted LLM call. null = no schedule.
+   * Cron expression (UTC, standard 5-field syntax, e.g. '0 3 * * *' for daily at 03:00 UTC) for refreshing this mental model on a fixed schedule. Mutually exclusive with refresh_after_consolidation — a model refreshes either after consolidation or on a cron schedule, not both. A scheduled refresh only runs when the model is stale (new memories in its scope since the last refresh); if nothing changed, the tick is skipped to avoid a wasted LLM call. In graph mode staleness means a durable change to a provenance memory, not a scope write, so a brand-new memory outside provenance never triggers this schedule. null = no schedule.
    */
   refresh_cron?: string | null;
   /**
@@ -5453,7 +5484,13 @@ export type OperationStatusResponse = {
   /**
    * Status
    */
-  status: "pending" | "processing" | "completed" | "failed" | "cancelled" | "not_found";
+  status:
+    | "pending"
+    | "processing"
+    | "completed"
+    | "failed"
+    | "cancelled"
+    | "not_found";
   /**
    * Operation Type
    */
@@ -6026,7 +6063,9 @@ export type RecallRequest = {
    *
    * Compound tag filter using boolean groups. Groups in the list are AND-ed. Each group is a leaf {tags, match} or compound {and: [...]}, {or: [...]}, {not: ...}. A leaf may set resolve='fuzzy' to match its tags against the bank's tags by trigram similarity instead of literally, so a query that says 'typsecript' still reaches memories tagged 'typescript'.
    */
-  tag_groups?: Array<TagGroupLeaf | TagGroupAndInput | TagGroupOrInput | TagGroupNotInput> | null;
+  tag_groups?: Array<
+    TagGroupLeaf | TagGroupAndInput | TagGroupOrInput | TagGroupNotInput
+  > | null;
   /**
    * Optional per-stage score floors, each inclusive (`>=`). `semantic` and `keyword` are retrieval-level cutoffs pushed into the SQL arm they name (overriding the global similarity/BM25 minimums for this request), and constrain only that arm: recall fuses four arms (semantic, keyword, graph, temporal) and returns a result surfaced by any of them, so a returned result reports null for a stage that did not surface it (a non-null score always clears its floor). Setting both therefore does not restrict the response to results clearing both. `reranker` and `final` are post-ranking filters applied to every scored result, so those floors *are* guaranteed by each result returned — use them for query abstention. Any field left unset imposes no floor; omitting `min_scores` entirely (the default) applies no score filtering. Use with care — the reranker's absolute scores are not calibrated across queries (a clearly-relevant match may score ~0.001 even though it is ranked first).
    */
@@ -6458,7 +6497,9 @@ export type ReflectRequest = {
    *
    * Compound tag filter using boolean groups. Groups in the list are AND-ed. Each group is a leaf {tags, match} or compound {and: [...]}, {or: [...]}, {not: ...}. Mutually exclusive with tags. A leaf may set resolve='fuzzy' to match its tags against the bank's tags by trigram similarity instead of literally, so a query that says 'typsecript' still reaches memories tagged 'typescript'.
    */
-  tag_groups?: Array<TagGroupLeaf | TagGroupAndInput | TagGroupOrInput | TagGroupNotInput> | null;
+  tag_groups?: Array<
+    TagGroupLeaf | TagGroupAndInput | TagGroupOrInput | TagGroupNotInput
+  > | null;
   /**
    * Apply All Directives
    *
@@ -6957,7 +6998,9 @@ export type TagGroupAndInput = {
   /**
    * And
    */
-  and: Array<TagGroupLeaf | TagGroupAndInput | TagGroupOrInput | TagGroupNotInput>;
+  and: Array<
+    TagGroupLeaf | TagGroupAndInput | TagGroupOrInput | TagGroupNotInput
+  >;
 };
 
 /**
@@ -6969,7 +7012,9 @@ export type TagGroupAndOutput = {
   /**
    * And
    */
-  and: Array<TagGroupLeaf | TagGroupAndOutput | TagGroupOrOutput | TagGroupNotOutput>;
+  and: Array<
+    TagGroupLeaf | TagGroupAndOutput | TagGroupOrOutput | TagGroupNotOutput
+  >;
 };
 
 /**
@@ -7025,7 +7070,9 @@ export type TagGroupOrInput = {
   /**
    * Or
    */
-  or: Array<TagGroupLeaf | TagGroupAndInput | TagGroupOrInput | TagGroupNotInput>;
+  or: Array<
+    TagGroupLeaf | TagGroupAndInput | TagGroupOrInput | TagGroupNotInput
+  >;
 };
 
 /**
@@ -7037,7 +7084,9 @@ export type TagGroupOrOutput = {
   /**
    * Or
    */
-  or: Array<TagGroupLeaf | TagGroupAndOutput | TagGroupOrOutput | TagGroupNotOutput>;
+  or: Array<
+    TagGroupLeaf | TagGroupAndOutput | TagGroupOrOutput | TagGroupNotOutput
+  >;
 };
 
 /**
@@ -7719,7 +7768,8 @@ export type GetLivenessResponses = {
   200: LivenessResponse;
 };
 
-export type GetLivenessResponse = GetLivenessResponses[keyof GetLivenessResponses];
+export type GetLivenessResponse =
+  GetLivenessResponses[keyof GetLivenessResponses];
 
 export type GetVersionData = {
   body?: never;
@@ -7927,7 +7977,8 @@ export type ListMemoriesResponses = {
   200: ListMemoryUnitsResponse;
 };
 
-export type ListMemoriesResponse = ListMemoriesResponses[keyof ListMemoriesResponses];
+export type ListMemoriesResponse =
+  ListMemoriesResponses[keyof ListMemoriesResponses];
 
 export type DryRunExtractMemoriesData = {
   body: DryRunExtractRequest;
@@ -8001,7 +8052,8 @@ export type PreviewPromptResponses = {
   200: PromptPreviewResponse;
 };
 
-export type PreviewPromptResponse = PreviewPromptResponses[keyof PreviewPromptResponses];
+export type PreviewPromptResponse =
+  PreviewPromptResponses[keyof PreviewPromptResponses];
 
 export type GetMemoryData = {
   body?: never;
@@ -8143,7 +8195,8 @@ export type RecallMemoriesErrors = {
   422: HttpValidationError;
 };
 
-export type RecallMemoriesError = RecallMemoriesErrors[keyof RecallMemoriesErrors];
+export type RecallMemoriesError =
+  RecallMemoriesErrors[keyof RecallMemoriesErrors];
 
 export type RecallMemoriesResponses = {
   /**
@@ -8152,7 +8205,8 @@ export type RecallMemoriesResponses = {
   200: RecallResponse;
 };
 
-export type RecallMemoriesResponse = RecallMemoriesResponses[keyof RecallMemoriesResponses];
+export type RecallMemoriesResponse =
+  RecallMemoriesResponses[keyof RecallMemoriesResponses];
 
 export type ReflectData = {
   body: ReflectRequest;
@@ -8285,7 +8339,8 @@ export type GetAgentStatsResponses = {
   200: BankStatsResponse;
 };
 
-export type GetAgentStatsResponse = GetAgentStatsResponses[keyof GetAgentStatsResponses];
+export type GetAgentStatsResponse =
+  GetAgentStatsResponses[keyof GetAgentStatsResponses];
 
 export type TestBankLlmData = {
   body?: never;
@@ -8321,7 +8376,8 @@ export type TestBankLlmResponses = {
   200: BankLlmHealthResponse;
 };
 
-export type TestBankLlmResponse = TestBankLlmResponses[keyof TestBankLlmResponses];
+export type TestBankLlmResponse =
+  TestBankLlmResponses[keyof TestBankLlmResponses];
 
 export type GetMemoriesTimeseriesData = {
   body?: never;
@@ -8445,7 +8501,8 @@ export type ListEntitiesResponses = {
   200: EntityListResponse;
 };
 
-export type ListEntitiesResponse = ListEntitiesResponses[keyof ListEntitiesResponses];
+export type ListEntitiesResponse =
+  ListEntitiesResponses[keyof ListEntitiesResponses];
 
 export type GetObservationTreeData = {
   body?: never;
@@ -8567,7 +8624,8 @@ export type GetEntityGraphErrors = {
   422: HttpValidationError;
 };
 
-export type GetEntityGraphError = GetEntityGraphErrors[keyof GetEntityGraphErrors];
+export type GetEntityGraphError =
+  GetEntityGraphErrors[keyof GetEntityGraphErrors];
 
 export type GetEntityGraphResponses = {
   /**
@@ -8576,7 +8634,8 @@ export type GetEntityGraphResponses = {
   200: EntityGraphResponse;
 };
 
-export type GetEntityGraphResponse = GetEntityGraphResponses[keyof GetEntityGraphResponses];
+export type GetEntityGraphResponse =
+  GetEntityGraphResponses[keyof GetEntityGraphResponses];
 
 export type GetEntityData = {
   body?: never;
@@ -8749,7 +8808,8 @@ export type ListMentalModelsErrors = {
   422: HttpValidationError;
 };
 
-export type ListMentalModelsError = ListMentalModelsErrors[keyof ListMentalModelsErrors];
+export type ListMentalModelsError =
+  ListMentalModelsErrors[keyof ListMentalModelsErrors];
 
 export type ListMentalModelsResponses = {
   /**
@@ -8758,7 +8818,8 @@ export type ListMentalModelsResponses = {
   200: MentalModelListResponse;
 };
 
-export type ListMentalModelsResponse = ListMentalModelsResponses[keyof ListMentalModelsResponses];
+export type ListMentalModelsResponse =
+  ListMentalModelsResponses[keyof ListMentalModelsResponses];
 
 export type CreateMentalModelData = {
   body: CreateMentalModelRequest;
@@ -8785,7 +8846,8 @@ export type CreateMentalModelErrors = {
   422: HttpValidationError;
 };
 
-export type CreateMentalModelError = CreateMentalModelErrors[keyof CreateMentalModelErrors];
+export type CreateMentalModelError =
+  CreateMentalModelErrors[keyof CreateMentalModelErrors];
 
 export type CreateMentalModelResponses = {
   /**
@@ -8826,7 +8888,8 @@ export type DeleteMentalModelErrors = {
   422: HttpValidationError;
 };
 
-export type DeleteMentalModelError = DeleteMentalModelErrors[keyof DeleteMentalModelErrors];
+export type DeleteMentalModelError =
+  DeleteMentalModelErrors[keyof DeleteMentalModelErrors];
 
 export type DeleteMentalModelResponses = {
   /**
@@ -8871,7 +8934,8 @@ export type GetMentalModelErrors = {
   422: HttpValidationError;
 };
 
-export type GetMentalModelError = GetMentalModelErrors[keyof GetMentalModelErrors];
+export type GetMentalModelError =
+  GetMentalModelErrors[keyof GetMentalModelErrors];
 
 export type GetMentalModelResponses = {
   /**
@@ -8880,7 +8944,8 @@ export type GetMentalModelResponses = {
   200: MentalModelResponse;
 };
 
-export type GetMentalModelResponse = GetMentalModelResponses[keyof GetMentalModelResponses];
+export type GetMentalModelResponse =
+  GetMentalModelResponses[keyof GetMentalModelResponses];
 
 export type UpdateMentalModelData = {
   body: UpdateMentalModelRequest;
@@ -8911,7 +8976,8 @@ export type UpdateMentalModelErrors = {
   422: HttpValidationError;
 };
 
-export type UpdateMentalModelError = UpdateMentalModelErrors[keyof UpdateMentalModelErrors];
+export type UpdateMentalModelError =
+  UpdateMentalModelErrors[keyof UpdateMentalModelErrors];
 
 export type UpdateMentalModelResponses = {
   /**
@@ -8994,7 +9060,8 @@ export type RefreshMentalModelErrors = {
   422: HttpValidationError;
 };
 
-export type RefreshMentalModelError = RefreshMentalModelErrors[keyof RefreshMentalModelErrors];
+export type RefreshMentalModelError =
+  RefreshMentalModelErrors[keyof RefreshMentalModelErrors];
 
 export type RefreshMentalModelResponses = {
   /**
@@ -9077,7 +9144,8 @@ export type ClearMentalModelErrors = {
   422: HttpValidationError;
 };
 
-export type ClearMentalModelError = ClearMentalModelErrors[keyof ClearMentalModelErrors];
+export type ClearMentalModelError =
+  ClearMentalModelErrors[keyof ClearMentalModelErrors];
 
 export type ClearMentalModelResponses = {
   /**
@@ -9086,7 +9154,8 @@ export type ClearMentalModelResponses = {
   200: MentalModelResponse;
 };
 
-export type ClearMentalModelResponse = ClearMentalModelResponses[keyof ClearMentalModelResponses];
+export type ClearMentalModelResponse =
+  ClearMentalModelResponses[keyof ClearMentalModelResponses];
 
 export type GetKnowledgeBaseTreeData = {
   body?: never;
@@ -9307,7 +9376,8 @@ export type CreateKnowledgePageErrors = {
   422: HttpValidationError;
 };
 
-export type CreateKnowledgePageError = CreateKnowledgePageErrors[keyof CreateKnowledgePageErrors];
+export type CreateKnowledgePageError =
+  CreateKnowledgePageErrors[keyof CreateKnowledgePageErrors];
 
 export type CreateKnowledgePageResponses = {
   /**
@@ -9384,7 +9454,8 @@ export type ExportKnowledgeBaseErrors = {
   422: HttpValidationError;
 };
 
-export type ExportKnowledgeBaseError = ExportKnowledgeBaseErrors[keyof ExportKnowledgeBaseErrors];
+export type ExportKnowledgeBaseError =
+  ExportKnowledgeBaseErrors[keyof ExportKnowledgeBaseErrors];
 
 export type ExportKnowledgeBaseResponses = {
   /**
@@ -9496,7 +9567,8 @@ export type SearchKnowledgeBaseErrors = {
   422: HttpValidationError;
 };
 
-export type SearchKnowledgeBaseError = SearchKnowledgeBaseErrors[keyof SearchKnowledgeBaseErrors];
+export type SearchKnowledgeBaseError =
+  SearchKnowledgeBaseErrors[keyof SearchKnowledgeBaseErrors];
 
 export type SearchKnowledgeBaseResponses = {
   /**
@@ -9608,7 +9680,8 @@ export type GetKnowledgePageErrors = {
   422: HttpValidationError;
 };
 
-export type GetKnowledgePageError = GetKnowledgePageErrors[keyof GetKnowledgePageErrors];
+export type GetKnowledgePageError =
+  GetKnowledgePageErrors[keyof GetKnowledgePageErrors];
 
 export type GetKnowledgePageResponses = {
   /**
@@ -9617,7 +9690,8 @@ export type GetKnowledgePageResponses = {
   200: PageResponse;
 };
 
-export type GetKnowledgePageResponse = GetKnowledgePageResponses[keyof GetKnowledgePageResponses];
+export type GetKnowledgePageResponse =
+  GetKnowledgePageResponses[keyof GetKnowledgePageResponses];
 
 export type GetPageData = {
   body?: never;
@@ -9688,7 +9762,8 @@ export type DeleteKnowledgeNodeErrors = {
   422: HttpValidationError;
 };
 
-export type DeleteKnowledgeNodeError = DeleteKnowledgeNodeErrors[keyof DeleteKnowledgeNodeErrors];
+export type DeleteKnowledgeNodeError =
+  DeleteKnowledgeNodeErrors[keyof DeleteKnowledgeNodeErrors];
 
 export type DeleteKnowledgeNodeResponses = {
   /**
@@ -9726,7 +9801,8 @@ export type UpdateKnowledgeNodeErrors = {
   422: HttpValidationError;
 };
 
-export type UpdateKnowledgeNodeError = UpdateKnowledgeNodeErrors[keyof UpdateKnowledgeNodeErrors];
+export type UpdateKnowledgeNodeError =
+  UpdateKnowledgeNodeErrors[keyof UpdateKnowledgeNodeErrors];
 
 export type UpdateKnowledgeNodeResponses = {
   /**
@@ -9872,7 +9948,8 @@ export type ListDirectivesErrors = {
   422: HttpValidationError;
 };
 
-export type ListDirectivesError = ListDirectivesErrors[keyof ListDirectivesErrors];
+export type ListDirectivesError =
+  ListDirectivesErrors[keyof ListDirectivesErrors];
 
 export type ListDirectivesResponses = {
   /**
@@ -9881,7 +9958,8 @@ export type ListDirectivesResponses = {
   200: DirectiveListResponse;
 };
 
-export type ListDirectivesResponse = ListDirectivesResponses[keyof ListDirectivesResponses];
+export type ListDirectivesResponse =
+  ListDirectivesResponses[keyof ListDirectivesResponses];
 
 export type CreateDirectiveData = {
   body: CreateDirectiveRequest;
@@ -9908,7 +9986,8 @@ export type CreateDirectiveErrors = {
   422: HttpValidationError;
 };
 
-export type CreateDirectiveError = CreateDirectiveErrors[keyof CreateDirectiveErrors];
+export type CreateDirectiveError =
+  CreateDirectiveErrors[keyof CreateDirectiveErrors];
 
 export type CreateDirectiveResponses = {
   /**
@@ -9917,7 +9996,8 @@ export type CreateDirectiveResponses = {
   200: DirectiveResponse;
 };
 
-export type CreateDirectiveResponse = CreateDirectiveResponses[keyof CreateDirectiveResponses];
+export type CreateDirectiveResponse =
+  CreateDirectiveResponses[keyof CreateDirectiveResponses];
 
 export type DeleteDirectiveData = {
   body?: never;
@@ -9948,7 +10028,8 @@ export type DeleteDirectiveErrors = {
   422: HttpValidationError;
 };
 
-export type DeleteDirectiveError = DeleteDirectiveErrors[keyof DeleteDirectiveErrors];
+export type DeleteDirectiveError =
+  DeleteDirectiveErrors[keyof DeleteDirectiveErrors];
 
 export type DeleteDirectiveResponses = {
   /**
@@ -9995,7 +10076,8 @@ export type GetDirectiveResponses = {
   200: DirectiveResponse;
 };
 
-export type GetDirectiveResponse = GetDirectiveResponses[keyof GetDirectiveResponses];
+export type GetDirectiveResponse =
+  GetDirectiveResponses[keyof GetDirectiveResponses];
 
 export type UpdateDirectiveData = {
   body: UpdateDirectiveRequest;
@@ -10026,7 +10108,8 @@ export type UpdateDirectiveErrors = {
   422: HttpValidationError;
 };
 
-export type UpdateDirectiveError = UpdateDirectiveErrors[keyof UpdateDirectiveErrors];
+export type UpdateDirectiveError =
+  UpdateDirectiveErrors[keyof UpdateDirectiveErrors];
 
 export type UpdateDirectiveResponses = {
   /**
@@ -10035,7 +10118,8 @@ export type UpdateDirectiveResponses = {
   200: DirectiveResponse;
 };
 
-export type UpdateDirectiveResponse = UpdateDirectiveResponses[keyof UpdateDirectiveResponses];
+export type UpdateDirectiveResponse =
+  UpdateDirectiveResponses[keyof UpdateDirectiveResponses];
 
 export type ListDocumentsData = {
   body?: never;
@@ -10120,7 +10204,8 @@ export type ListDocumentsResponses = {
   200: ListDocumentsResponse;
 };
 
-export type ListDocumentsResponse2 = ListDocumentsResponses[keyof ListDocumentsResponses];
+export type ListDocumentsResponse2 =
+  ListDocumentsResponses[keyof ListDocumentsResponses];
 
 export type ListDocumentChunksData = {
   body?: never;
@@ -10164,7 +10249,8 @@ export type ListDocumentChunksErrors = {
   422: HttpValidationError;
 };
 
-export type ListDocumentChunksError = ListDocumentChunksErrors[keyof ListDocumentChunksErrors];
+export type ListDocumentChunksError =
+  ListDocumentChunksErrors[keyof ListDocumentChunksErrors];
 
 export type ListDocumentChunksResponses = {
   /**
@@ -10218,7 +10304,8 @@ export type GetDocumentHistoryErrors = {
   422: HttpValidationError;
 };
 
-export type GetDocumentHistoryError = GetDocumentHistoryErrors[keyof GetDocumentHistoryErrors];
+export type GetDocumentHistoryError =
+  GetDocumentHistoryErrors[keyof GetDocumentHistoryErrors];
 
 export type GetDocumentHistoryResponses = {
   /**
@@ -10259,7 +10346,8 @@ export type ReprocessDocumentErrors = {
   422: HttpValidationError;
 };
 
-export type ReprocessDocumentError = ReprocessDocumentErrors[keyof ReprocessDocumentErrors];
+export type ReprocessDocumentError =
+  ReprocessDocumentErrors[keyof ReprocessDocumentErrors];
 
 export type ReprocessDocumentResponses = {
   /**
@@ -10300,7 +10388,8 @@ export type DeleteDocumentErrors = {
   422: HttpValidationError;
 };
 
-export type DeleteDocumentError = DeleteDocumentErrors[keyof DeleteDocumentErrors];
+export type DeleteDocumentError =
+  DeleteDocumentErrors[keyof DeleteDocumentErrors];
 
 export type DeleteDocumentResponses = {
   /**
@@ -10309,7 +10398,8 @@ export type DeleteDocumentResponses = {
   200: DeleteDocumentResponse;
 };
 
-export type DeleteDocumentResponse2 = DeleteDocumentResponses[keyof DeleteDocumentResponses];
+export type DeleteDocumentResponse2 =
+  DeleteDocumentResponses[keyof DeleteDocumentResponses];
 
 export type GetDocumentData = {
   body?: never;
@@ -10349,7 +10439,8 @@ export type GetDocumentResponses = {
   200: DocumentResponse;
 };
 
-export type GetDocumentResponse = GetDocumentResponses[keyof GetDocumentResponses];
+export type GetDocumentResponse =
+  GetDocumentResponses[keyof GetDocumentResponses];
 
 export type UpdateDocumentData = {
   body: UpdateDocumentRequest;
@@ -10380,7 +10471,8 @@ export type UpdateDocumentErrors = {
   422: HttpValidationError;
 };
 
-export type UpdateDocumentError = UpdateDocumentErrors[keyof UpdateDocumentErrors];
+export type UpdateDocumentError =
+  UpdateDocumentErrors[keyof UpdateDocumentErrors];
 
 export type UpdateDocumentResponses = {
   /**
@@ -10389,7 +10481,8 @@ export type UpdateDocumentResponses = {
   200: UpdateDocumentResponse;
 };
 
-export type UpdateDocumentResponse2 = UpdateDocumentResponses[keyof UpdateDocumentResponses];
+export type UpdateDocumentResponse2 =
+  UpdateDocumentResponses[keyof UpdateDocumentResponses];
 
 export type ListTagsData = {
   body?: never;
@@ -10552,7 +10645,8 @@ export type ListOperationsErrors = {
   422: HttpValidationError;
 };
 
-export type ListOperationsError = ListOperationsErrors[keyof ListOperationsErrors];
+export type ListOperationsError =
+  ListOperationsErrors[keyof ListOperationsErrors];
 
 export type ListOperationsResponses = {
   /**
@@ -10561,7 +10655,8 @@ export type ListOperationsResponses = {
   200: OperationsListResponse;
 };
 
-export type ListOperationsResponse = ListOperationsResponses[keyof ListOperationsResponses];
+export type ListOperationsResponse =
+  ListOperationsResponses[keyof ListOperationsResponses];
 
 export type CancelOperationData = {
   body?: never;
@@ -10592,7 +10687,8 @@ export type CancelOperationErrors = {
   422: HttpValidationError;
 };
 
-export type CancelOperationError = CancelOperationErrors[keyof CancelOperationErrors];
+export type CancelOperationError =
+  CancelOperationErrors[keyof CancelOperationErrors];
 
 export type CancelOperationResponses = {
   /**
@@ -10601,7 +10697,8 @@ export type CancelOperationResponses = {
   200: CancelOperationResponse;
 };
 
-export type CancelOperationResponse2 = CancelOperationResponses[keyof CancelOperationResponses];
+export type CancelOperationResponse2 =
+  CancelOperationResponses[keyof CancelOperationResponses];
 
 export type GetOperationStatusData = {
   body?: never;
@@ -10639,7 +10736,8 @@ export type GetOperationStatusErrors = {
   422: HttpValidationError;
 };
 
-export type GetOperationStatusError = GetOperationStatusErrors[keyof GetOperationStatusErrors];
+export type GetOperationStatusError =
+  GetOperationStatusErrors[keyof GetOperationStatusErrors];
 
 export type GetOperationStatusResponses = {
   /**
@@ -10680,7 +10778,8 @@ export type RetryOperationErrors = {
   422: HttpValidationError;
 };
 
-export type RetryOperationError = RetryOperationErrors[keyof RetryOperationErrors];
+export type RetryOperationError =
+  RetryOperationErrors[keyof RetryOperationErrors];
 
 export type RetryOperationResponses = {
   /**
@@ -10689,7 +10788,8 @@ export type RetryOperationResponses = {
   200: RetryOperationResponse;
 };
 
-export type RetryOperationResponse2 = RetryOperationResponses[keyof RetryOperationResponses];
+export type RetryOperationResponse2 =
+  RetryOperationResponses[keyof RetryOperationResponses];
 
 export type DeleteOperationData = {
   body?: never;
@@ -10720,7 +10820,8 @@ export type DeleteOperationErrors = {
   422: HttpValidationError;
 };
 
-export type DeleteOperationError = DeleteOperationErrors[keyof DeleteOperationErrors];
+export type DeleteOperationError =
+  DeleteOperationErrors[keyof DeleteOperationErrors];
 
 export type DeleteOperationResponses = {
   /**
@@ -10729,7 +10830,8 @@ export type DeleteOperationResponses = {
   200: DeleteOperationResponse;
 };
 
-export type DeleteOperationResponse2 = DeleteOperationResponses[keyof DeleteOperationResponses];
+export type DeleteOperationResponse2 =
+  DeleteOperationResponses[keyof DeleteOperationResponses];
 
 export type GetBankProfileData = {
   body?: never;
@@ -10756,7 +10858,8 @@ export type GetBankProfileErrors = {
   422: HttpValidationError;
 };
 
-export type GetBankProfileError = GetBankProfileErrors[keyof GetBankProfileErrors];
+export type GetBankProfileError =
+  GetBankProfileErrors[keyof GetBankProfileErrors];
 
 export type GetBankProfileResponses = {
   /**
@@ -10765,7 +10868,8 @@ export type GetBankProfileResponses = {
   200: BankProfileResponse;
 };
 
-export type GetBankProfileResponse = GetBankProfileResponses[keyof GetBankProfileResponses];
+export type GetBankProfileResponse =
+  GetBankProfileResponses[keyof GetBankProfileResponses];
 
 export type UpdateBankDispositionData = {
   body: UpdateDispositionRequest;
@@ -10830,7 +10934,8 @@ export type AddBankBackgroundErrors = {
   422: HttpValidationError;
 };
 
-export type AddBankBackgroundError = AddBankBackgroundErrors[keyof AddBankBackgroundErrors];
+export type AddBankBackgroundError =
+  AddBankBackgroundErrors[keyof AddBankBackgroundErrors];
 
 export type AddBankBackgroundResponses = {
   /**
@@ -10867,7 +10972,8 @@ export type ListBankAliasesErrors = {
   422: HttpValidationError;
 };
 
-export type ListBankAliasesError = ListBankAliasesErrors[keyof ListBankAliasesErrors];
+export type ListBankAliasesError =
+  ListBankAliasesErrors[keyof ListBankAliasesErrors];
 
 export type ListBankAliasesResponses = {
   /**
@@ -10876,7 +10982,8 @@ export type ListBankAliasesResponses = {
   200: BankAliasesResponse;
 };
 
-export type ListBankAliasesResponse = ListBankAliasesResponses[keyof ListBankAliasesResponses];
+export type ListBankAliasesResponse =
+  ListBankAliasesResponses[keyof ListBankAliasesResponses];
 
 export type CreateBankAliasData = {
   body: CreateBankAliasRequest;
@@ -10903,7 +11010,8 @@ export type CreateBankAliasErrors = {
   422: HttpValidationError;
 };
 
-export type CreateBankAliasError = CreateBankAliasErrors[keyof CreateBankAliasErrors];
+export type CreateBankAliasError =
+  CreateBankAliasErrors[keyof CreateBankAliasErrors];
 
 export type CreateBankAliasResponses = {
   /**
@@ -10912,7 +11020,8 @@ export type CreateBankAliasResponses = {
   201: BankAliasesResponse;
 };
 
-export type CreateBankAliasResponse = CreateBankAliasResponses[keyof CreateBankAliasResponses];
+export type CreateBankAliasResponse =
+  CreateBankAliasResponses[keyof CreateBankAliasResponses];
 
 export type DeleteBankAliasData = {
   body?: never;
@@ -10943,7 +11052,8 @@ export type DeleteBankAliasErrors = {
   422: HttpValidationError;
 };
 
-export type DeleteBankAliasError = DeleteBankAliasErrors[keyof DeleteBankAliasErrors];
+export type DeleteBankAliasError =
+  DeleteBankAliasErrors[keyof DeleteBankAliasErrors];
 
 export type DeleteBankAliasResponses = {
   /**
@@ -10952,7 +11062,8 @@ export type DeleteBankAliasResponses = {
   200: BankAliasesResponse;
 };
 
-export type DeleteBankAliasResponse = DeleteBankAliasResponses[keyof DeleteBankAliasResponses];
+export type DeleteBankAliasResponse =
+  DeleteBankAliasResponses[keyof DeleteBankAliasResponses];
 
 export type SetBankAliasPrimaryData = {
   body: SetBankAliasPrimaryRequest;
@@ -10983,7 +11094,8 @@ export type SetBankAliasPrimaryErrors = {
   422: HttpValidationError;
 };
 
-export type SetBankAliasPrimaryError = SetBankAliasPrimaryErrors[keyof SetBankAliasPrimaryErrors];
+export type SetBankAliasPrimaryError =
+  SetBankAliasPrimaryErrors[keyof SetBankAliasPrimaryErrors];
 
 export type SetBankAliasPrimaryResponses = {
   /**
@@ -11092,7 +11204,8 @@ export type CreateOrUpdateBankErrors = {
   422: HttpValidationError;
 };
 
-export type CreateOrUpdateBankError = CreateOrUpdateBankErrors[keyof CreateOrUpdateBankErrors];
+export type CreateOrUpdateBankError =
+  CreateOrUpdateBankErrors[keyof CreateOrUpdateBankErrors];
 
 export type CreateOrUpdateBankResponses = {
   /**
@@ -11141,7 +11254,8 @@ export type ImportBankTemplateErrors = {
   422: HttpValidationError;
 };
 
-export type ImportBankTemplateError = ImportBankTemplateErrors[keyof ImportBankTemplateErrors];
+export type ImportBankTemplateError =
+  ImportBankTemplateErrors[keyof ImportBankTemplateErrors];
 
 export type ImportBankTemplateResponses = {
   /**
@@ -11182,7 +11296,8 @@ export type ExportBankTemplateErrors = {
   422: HttpValidationError;
 };
 
-export type ExportBankTemplateError = ExportBankTemplateErrors[keyof ExportBankTemplateErrors];
+export type ExportBankTemplateError =
+  ExportBankTemplateErrors[keyof ExportBankTemplateErrors];
 
 export type ExportBankTemplateResponses = {
   /**
@@ -11261,7 +11376,8 @@ export type ImportDocumentsErrors = {
   422: HttpValidationError;
 };
 
-export type ImportDocumentsError = ImportDocumentsErrors[keyof ImportDocumentsErrors];
+export type ImportDocumentsError =
+  ImportDocumentsErrors[keyof ImportDocumentsErrors];
 
 export type ImportDocumentsResponses = {
   /**
@@ -11270,7 +11386,8 @@ export type ImportDocumentsResponses = {
   202: DocumentImportSubmitResponse;
 };
 
-export type ImportDocumentsResponse = ImportDocumentsResponses[keyof ImportDocumentsResponses];
+export type ImportDocumentsResponse =
+  ImportDocumentsResponses[keyof ImportDocumentsResponses];
 
 export type ExportDocumentsData = {
   body?: never;
@@ -11316,7 +11433,8 @@ export type ExportDocumentsErrors = {
   422: HttpValidationError;
 };
 
-export type ExportDocumentsError = ExportDocumentsErrors[keyof ExportDocumentsErrors];
+export type ExportDocumentsError =
+  ExportDocumentsErrors[keyof ExportDocumentsErrors];
 
 export type ExportDocumentsResponses = {
   /**
@@ -11325,7 +11443,8 @@ export type ExportDocumentsResponses = {
   202: DocumentExportSubmitResponse;
 };
 
-export type ExportDocumentsResponse = ExportDocumentsResponses[keyof ExportDocumentsResponses];
+export type ExportDocumentsResponse =
+  ExportDocumentsResponses[keyof ExportDocumentsResponses];
 
 export type ExportBankTransferData = {
   body?: never;
@@ -11381,7 +11500,8 @@ export type ExportBankTransferErrors = {
   422: HttpValidationError;
 };
 
-export type ExportBankTransferError = ExportBankTransferErrors[keyof ExportBankTransferErrors];
+export type ExportBankTransferError =
+  ExportBankTransferErrors[keyof ExportBankTransferErrors];
 
 export type ExportBankTransferResponses = {
   /**
@@ -11455,7 +11575,8 @@ export type ImportBankTransferErrors = {
   422: HttpValidationError;
 };
 
-export type ImportBankTransferError = ImportBankTransferErrors[keyof ImportBankTransferErrors];
+export type ImportBankTransferError =
+  ImportBankTransferErrors[keyof ImportBankTransferErrors];
 
 export type ImportBankTransferResponses = {
   /**
@@ -11561,7 +11682,8 @@ export type GetBankAttachmentErrors = {
   422: HttpValidationError;
 };
 
-export type GetBankAttachmentError = GetBankAttachmentErrors[keyof GetBankAttachmentErrors];
+export type GetBankAttachmentError =
+  GetBankAttachmentErrors[keyof GetBankAttachmentErrors];
 
 export type GetBankAttachmentResponses = {
   /**
@@ -11607,7 +11729,8 @@ export type DownloadFileResponses = {
   200: Blob | File;
 };
 
-export type DownloadFileResponse = DownloadFileResponses[keyof DownloadFileResponses];
+export type DownloadFileResponse =
+  DownloadFileResponses[keyof DownloadFileResponses];
 
 export type GetBankTemplateSchemaData = {
   body?: never;
@@ -11648,7 +11771,8 @@ export type ClearObservationsErrors = {
   422: HttpValidationError;
 };
 
-export type ClearObservationsError = ClearObservationsErrors[keyof ClearObservationsErrors];
+export type ClearObservationsError =
+  ClearObservationsErrors[keyof ClearObservationsErrors];
 
 export type ClearObservationsResponses = {
   /**
@@ -11862,7 +11986,8 @@ export type ResetBankConfigErrors = {
   422: HttpValidationError;
 };
 
-export type ResetBankConfigError = ResetBankConfigErrors[keyof ResetBankConfigErrors];
+export type ResetBankConfigError =
+  ResetBankConfigErrors[keyof ResetBankConfigErrors];
 
 export type ResetBankConfigResponses = {
   /**
@@ -11871,7 +11996,8 @@ export type ResetBankConfigResponses = {
   200: BankConfigResponse;
 };
 
-export type ResetBankConfigResponse = ResetBankConfigResponses[keyof ResetBankConfigResponses];
+export type ResetBankConfigResponse =
+  ResetBankConfigResponses[keyof ResetBankConfigResponses];
 
 export type GetBankConfigData = {
   body?: never;
@@ -11911,7 +12037,8 @@ export type GetBankConfigResponses = {
   200: BankConfigResponse;
 };
 
-export type GetBankConfigResponse = GetBankConfigResponses[keyof GetBankConfigResponses];
+export type GetBankConfigResponse =
+  GetBankConfigResponses[keyof GetBankConfigResponses];
 
 export type UpdateBankConfigData = {
   body: BankConfigUpdate;
@@ -11938,7 +12065,8 @@ export type UpdateBankConfigErrors = {
   422: HttpValidationError;
 };
 
-export type UpdateBankConfigError = UpdateBankConfigErrors[keyof UpdateBankConfigErrors];
+export type UpdateBankConfigError =
+  UpdateBankConfigErrors[keyof UpdateBankConfigErrors];
 
 export type UpdateBankConfigResponses = {
   /**
@@ -11947,7 +12075,8 @@ export type UpdateBankConfigResponses = {
   200: BankConfigResponse;
 };
 
-export type UpdateBankConfigResponse = UpdateBankConfigResponses[keyof UpdateBankConfigResponses];
+export type UpdateBankConfigResponse =
+  UpdateBankConfigResponses[keyof UpdateBankConfigResponses];
 
 export type TriggerConsolidationData = {
   /**
@@ -12041,7 +12170,8 @@ export type ListWebhooksResponses = {
   200: WebhookListResponse;
 };
 
-export type ListWebhooksResponse = ListWebhooksResponses[keyof ListWebhooksResponses];
+export type ListWebhooksResponse =
+  ListWebhooksResponses[keyof ListWebhooksResponses];
 
 export type CreateWebhookData = {
   body: CreateWebhookRequest;
@@ -12077,7 +12207,8 @@ export type CreateWebhookResponses = {
   201: WebhookResponse;
 };
 
-export type CreateWebhookResponse = CreateWebhookResponses[keyof CreateWebhookResponses];
+export type CreateWebhookResponse =
+  CreateWebhookResponses[keyof CreateWebhookResponses];
 
 export type DeleteWebhookData = {
   body?: never;
@@ -12117,7 +12248,8 @@ export type DeleteWebhookResponses = {
   200: DeleteResponse;
 };
 
-export type DeleteWebhookResponse = DeleteWebhookResponses[keyof DeleteWebhookResponses];
+export type DeleteWebhookResponse =
+  DeleteWebhookResponses[keyof DeleteWebhookResponses];
 
 export type UpdateWebhookData = {
   body: UpdateWebhookRequest;
@@ -12157,7 +12289,8 @@ export type UpdateWebhookResponses = {
   200: WebhookResponse;
 };
 
-export type UpdateWebhookResponse = UpdateWebhookResponses[keyof UpdateWebhookResponses];
+export type UpdateWebhookResponse =
+  UpdateWebhookResponses[keyof UpdateWebhookResponses];
 
 export type ListWebhookDeliveriesData = {
   body?: never;
@@ -12246,7 +12379,8 @@ export type ClearBankMemoriesErrors = {
   422: HttpValidationError;
 };
 
-export type ClearBankMemoriesError = ClearBankMemoriesErrors[keyof ClearBankMemoriesErrors];
+export type ClearBankMemoriesError =
+  ClearBankMemoriesErrors[keyof ClearBankMemoriesErrors];
 
 export type ClearBankMemoriesResponses = {
   /**
@@ -12283,7 +12417,8 @@ export type RetainMemoriesErrors = {
   422: HttpValidationError;
 };
 
-export type RetainMemoriesError = RetainMemoriesErrors[keyof RetainMemoriesErrors];
+export type RetainMemoriesError =
+  RetainMemoriesErrors[keyof RetainMemoriesErrors];
 
 export type RetainMemoriesResponses = {
   /**
@@ -12292,7 +12427,8 @@ export type RetainMemoriesResponses = {
   200: RetainResponse;
 };
 
-export type RetainMemoriesResponse = RetainMemoriesResponses[keyof RetainMemoriesResponses];
+export type RetainMemoriesResponse =
+  RetainMemoriesResponses[keyof RetainMemoriesResponses];
 
 export type FileRetainData = {
   body: BodyFileRetain;
@@ -12328,7 +12464,8 @@ export type FileRetainResponses = {
   200: FileRetainResponse;
 };
 
-export type FileRetainResponse2 = FileRetainResponses[keyof FileRetainResponses];
+export type FileRetainResponse2 =
+  FileRetainResponses[keyof FileRetainResponses];
 
 export type ListAuditLogsData = {
   body?: never;
@@ -12405,7 +12542,8 @@ export type ListAuditLogsResponses = {
   200: AuditLogListResponse;
 };
 
-export type ListAuditLogsResponse = ListAuditLogsResponses[keyof ListAuditLogsResponses];
+export type ListAuditLogsResponse =
+  ListAuditLogsResponses[keyof ListAuditLogsResponses];
 
 export type AuditLogStatsData = {
   body?: never;
@@ -12458,7 +12596,8 @@ export type AuditLogStatsResponses = {
   200: AuditLogStatsResponse;
 };
 
-export type AuditLogStatsResponse2 = AuditLogStatsResponses[keyof AuditLogStatsResponses];
+export type AuditLogStatsResponse2 =
+  AuditLogStatsResponses[keyof AuditLogStatsResponses];
 
 export type GetAuditLogData = {
   body?: never;
@@ -12502,7 +12641,8 @@ export type GetAuditLogResponses = {
   200: AuditLogEntry;
 };
 
-export type GetAuditLogResponse = GetAuditLogResponses[keyof GetAuditLogResponses];
+export type GetAuditLogResponse =
+  GetAuditLogResponses[keyof GetAuditLogResponses];
 
 export type ListLlmRequestsData = {
   body?: never;
@@ -12612,7 +12752,8 @@ export type ListLlmRequestsErrors = {
   422: HttpValidationError;
 };
 
-export type ListLlmRequestsError = ListLlmRequestsErrors[keyof ListLlmRequestsErrors];
+export type ListLlmRequestsError =
+  ListLlmRequestsErrors[keyof ListLlmRequestsErrors];
 
 export type ListLlmRequestsResponses = {
   /**
@@ -12621,7 +12762,8 @@ export type ListLlmRequestsResponses = {
   200: LlmRequestListResponse;
 };
 
-export type ListLlmRequestsResponse = ListLlmRequestsResponses[keyof ListLlmRequestsResponses];
+export type ListLlmRequestsResponse =
+  ListLlmRequestsResponses[keyof ListLlmRequestsResponses];
 
 export type LlmRequestStatsData = {
   body?: never;
@@ -12677,7 +12819,8 @@ export type LlmRequestStatsErrors = {
   422: HttpValidationError;
 };
 
-export type LlmRequestStatsError = LlmRequestStatsErrors[keyof LlmRequestStatsErrors];
+export type LlmRequestStatsError =
+  LlmRequestStatsErrors[keyof LlmRequestStatsErrors];
 
 export type LlmRequestStatsResponses = {
   /**
@@ -12686,4 +12829,5 @@ export type LlmRequestStatsResponses = {
   200: LlmRequestStatsResponse;
 };
 
-export type LlmRequestStatsResponse2 = LlmRequestStatsResponses[keyof LlmRequestStatsResponses];
+export type LlmRequestStatsResponse2 =
+  LlmRequestStatsResponses[keyof LlmRequestStatsResponses];

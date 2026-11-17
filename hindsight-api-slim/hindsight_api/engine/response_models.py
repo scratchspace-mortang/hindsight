@@ -1064,6 +1064,25 @@ class MentalModelTrigger(BaseModel):
             "regeneration automatically."
         ),
     )
+    staleness_check: Literal["tagscope", "graph"] = Field(
+        default="tagscope",
+        description=(
+            "How this model's staleness is decided. 'tagscope' (default) uses the "
+            "scope-plus-watermark check; 'graph' uses provenance (the memories the "
+            "model was built from). When the field is absent it reads back as 'tagscope'. "
+            "Graph mode is PostgreSQL-only: on a non-Postgres (Oracle) backend there is "
+            "no change-record table, so a graph-mode model is answered by the tagscope "
+            "rule there."
+        ),
+    )
+    graph_stale: Literal["cited_memories", "read_memories"] = Field(
+        default="cited_memories",
+        description=(
+            "Which provenance marks the model stale in graph mode: 'cited_memories' "
+            "(default) or 'read_memories'. Only meaningful when staleness_check is "
+            "'graph'. When the field is absent it reads back as 'cited_memories'."
+        ),
+    )
     refresh_after_consolidation: bool = Field(
         default=False,
         description="If true, refresh this mental model after observations consolidation (real-time mode)",
@@ -1076,7 +1095,9 @@ class MentalModelTrigger(BaseModel):
             "refresh_after_consolidation — a model refreshes either after consolidation or on a cron "
             "schedule, not both. A scheduled refresh only runs when the model is stale (new memories in "
             "its scope since the last refresh); if nothing changed, the tick is skipped to avoid a "
-            "wasted LLM call. null = no schedule."
+            "wasted LLM call. In graph mode staleness means a durable change to a provenance memory, "
+            "not a scope write, so a brand-new memory outside provenance never triggers this schedule. "
+            "null = no schedule."
         ),
     )
     full_refresh_cron: str | None = Field(

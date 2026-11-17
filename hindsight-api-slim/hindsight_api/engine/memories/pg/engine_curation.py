@@ -44,11 +44,34 @@ async def locate_memories(*, conn, fq_table: Callable[[str], str], unit_ids: lis
     return [MemoryLocation(unit_id=str(row["id"]), bank_id=row["bank_id"], fact_type=row["fact_type"]) for row in rows]
 
 
+async def purge_change_events_for_subjects(conn, fq_table, bank_id: str | None, unit_ids) -> None:
+    """Drop change records whose subject is being deleted, so records do not
+    outlive their subject.
+    Postgres only — the table does not exist on Oracle."""
+    from ...schema import _is_oracle  # noqa: PLC0415
+
+    if _is_oracle() or not unit_ids:
+        return
+    ids = [uuid.UUID(str(u)) for u in unit_ids]
+    if bank_id:
+        await conn.execute(
+            f"DELETE FROM {fq_table('memory_change_events')} WHERE bank_id = $1 AND subject_id = ANY($2::uuid[])",
+            bank_id,
+            ids,
+        )
+    else:
+        await conn.execute(
+            f"DELETE FROM {fq_table('memory_change_events')} WHERE subject_id = ANY($1::uuid[])",
+            ids,
+        )
+
+
 async def delete_memory(*, conn, ops, fq_table: Callable[[str], str], bank_id: str | None, unit_id: str) -> str | None:
     """Delete one memory (its links first, in lock order); the deleted id, or None."""
     # Links in lock order before the cascade reaches them (see delete_unit_links).
     if bank_id:
         await ops.delete_unit_links(conn, fq_table("memory_links"), bank_id, [unit_id])
+    await purge_change_events_for_subjects(conn, fq_table, bank_id, [unit_id])
     deleted = await conn.fetchval(f"DELETE FROM {fq_table('memory_units')} WHERE id = $1 RETURNING id", unit_id)
     return str(deleted) if deleted is not None else None
 
@@ -62,6 +85,7 @@ async def delete_memories(*, conn, ops, fq_table: Callable[[str], str], bank_id:
     deleted = 0
     for i in range(0, len(unit_ids), _DELETE_CHUNK_SIZE):
         chunk = unit_ids[i : i + _DELETE_CHUNK_SIZE]
+        await purge_change_events_for_subjects(conn, fq_table, bank_id, chunk)
         tag = await conn.execute(
             f"DELETE FROM {fq_table('memory_units')} WHERE id = ANY($1::uuid[])",
             chunk,
@@ -102,6 +126,18 @@ async def delete_bank_memories_of_type(
     """Delete a bank's live and archived memories of one fact_type (links first)."""
     # Links in lock order before the cascade reaches them (see delete_unit_links).
     await ops.delete_unit_links(conn, fq_table("memory_links"), bank_id, unit_ids)
+    # Change records for the deleted subjects go with them, named
+    # by fact type while the rows still exist.
+    from ...schema import _is_oracle  # noqa: PLC0415
+
+    if not _is_oracle():
+        await conn.execute(
+            f"DELETE FROM {fq_table('memory_change_events')} WHERE bank_id = $1 "
+            f"AND subject_id IN (SELECT id FROM {fq_table('memory_units')} WHERE bank_id = $1 AND fact_type = $2 "
+            f"UNION SELECT id FROM {fq_table('invalidated_memory_units')} WHERE bank_id = $1 AND fact_type = $2)",
+            bank_id,
+            fact_type,
+        )
     await conn.execute(
         f"DELETE FROM {fq_table('memory_units')} WHERE bank_id = $1 AND fact_type = $2",
         bank_id,
@@ -168,6 +204,13 @@ async def purge_bank_rows(*, conn, fq_table: Callable[[str], str], bank_id: str)
     # would otherwise outlive the bank.
     await conn.execute(f"DELETE FROM {fq_table('graph_maintenance_queue')} WHERE bank_id = $1", bank_id)
     await conn.execute(f"DELETE FROM {fq_table('entity_maintenance_queue')} WHERE bank_id = $1", bank_id)
+
+    # Change records scope by bank_id without a cascading FK, so they would
+    # outlive the bank. Postgres only.
+    from ...schema import _is_oracle  # noqa: PLC0415
+
+    if not _is_oracle():
+        await conn.execute(f"DELETE FROM {fq_table('memory_change_events')} WHERE bank_id = $1", bank_id)
     return legacy_files
 
 
@@ -179,6 +222,16 @@ async def clear_observations_and_requeue(*, conn, fq_table: Callable[[str], str]
         bank_id,
     )
 
+    # Change records for the deleted observations go with them.
+    from ...schema import _is_oracle  # noqa: PLC0415
+
+    if not _is_oracle():
+        await conn.execute(
+            f"DELETE FROM {fq_table('memory_change_events')} WHERE bank_id = $1 "
+            f"AND subject_id IN (SELECT id FROM {fq_table('memory_units')} "
+            f"WHERE bank_id = $1 AND fact_type = 'observation')",
+            bank_id,
+        )
     # Delete all observations
     await conn.execute(
         f"DELETE FROM {fq_table('memory_units')} WHERE bank_id = $1 AND fact_type = 'observation'",
