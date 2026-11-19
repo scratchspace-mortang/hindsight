@@ -2456,6 +2456,43 @@ async def page_marks_read(
     return answers
 
 
+async def page_shortlist(
+    *,
+    memory_engine: "MemoryEngine",
+    bank_id: str,
+    observation_text: str,
+    observation_tags: list[str],
+    scope: str,
+    request_context: Any,
+    limit: int = 10,
+) -> list[tuple[str, str]]:
+    """C7: one page search for one checked-set subject, keeping only id and question.
+
+    ``search_pages`` embeds its own query string and accepts no precomputed embedding,
+    so one call here is one embedding plus one search. ``bank_wide`` passes no tag
+    filter (internal context is unscoped by default); ``tag_wide`` passes an explicit
+    ``PageTagFilter`` built from the subject's current tags, and a subject with no tags
+    yields the empty shortlist without searching. The page snippet and body are dropped
+    before this seam returns, so neither can reach the decision call.
+    """
+    if scope == "tag_wide" and not observation_tags:
+        return []
+    tag_filter: PageTagFilter | None = None
+    if scope == "tag_wide":
+        # "any" and "all" deliberately include untagged pages (the staleness
+        # scope rule). Page marking must not cross scopes, so require a tagged
+        # page carrying every one of the subject's tags.
+        tag_filter = PageTagFilter(tags=list(observation_tags), tags_match="all_strict")
+    rows = await memory_engine.search_pages(
+        bank_id,
+        observation_text,
+        limit=limit,
+        tag_filter=tag_filter,
+        request_context=request_context,
+    )
+    return [(str(row["id"]), str(row.get("source_query") or "")) for row in rows]
+
+
 def _graph_staleness_settings(trigger: Any) -> tuple[str, str]:
     """``(staleness_check, graph_stale)`` from a stored trigger, with defaults.
 
