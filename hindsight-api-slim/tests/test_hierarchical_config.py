@@ -164,7 +164,7 @@ async def test_hierarchical_fields_categorization():
     assert "reflect_kb_search_apply_tags" in configurable
 
     # Verify count is correct
-    assert len(configurable) == 63
+    assert len(configurable) == 64
 
     # Verify credential fields (NEVER exposed)
     assert "llm_api_key" in credentials

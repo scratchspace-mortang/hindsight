@@ -10975,6 +10975,22 @@
             "title": "Consolidation Llm Parallelism",
             "description": "Number of consolidation LLM batches processed concurrently"
           },
+          "observation_marking_page_stale": {
+            "anyOf": [
+              {
+                "type": "string",
+                "enum": [
+                  "bank_wide",
+                  "tag_wide"
+                ]
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Observation Marking Page Stale",
+            "description": "How a page check searches for stale candidates: 'bank_wide' searches the whole bank, 'tag_wide' only the page's tags (default when unset)."
+          },
           "recall_include_chunks": {
             "anyOf": [
               {
@@ -18412,7 +18428,7 @@
               }
             ],
             "title": "Is Stale",
-            "description": "Pages only, populated by the tree endpoint. True when a memory in *this page's* scope \u2014 its tags and fact types \u2014 has been written since the page last read the memories. That is the same check a scheduled refresh runs before spending an LLM call, so a flagged page is one a refresh would actually rewrite. Deletions are not observed: removing an in-scope memory leaves no write behind, so it does not raise this flag."
+            "description": "Pages only, populated by the tree endpoint. True when a memory in *this page's* scope \u2014 its tags and fact types \u2014 has been written since the page last read the memories. That is the same check a scheduled refresh runs before spending an LLM call, so a flagged page is one a refresh would actually rewrite. Deleting a memory this page was built from also raises this flag in both modes; in graph mode a change to a provenance memory raises it too. In graph mode the rule is the provenance baseline instead of the scope: a brand-new memory outside every provenance observation never raises this flag. Deleting a memory the page never cited or read does not."
           },
           "last_refresh_failed_at": {
             "anyOf": [

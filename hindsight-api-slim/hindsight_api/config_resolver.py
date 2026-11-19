@@ -15,7 +15,7 @@ import logging
 from dataclasses import dataclass, fields, replace
 from functools import lru_cache
 from types import UnionType
-from typing import TYPE_CHECKING, Any, Union, get_args, get_origin
+from typing import TYPE_CHECKING, Any, Literal, Union, get_args, get_origin
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from hindsight_api.config import (
@@ -776,14 +776,17 @@ _WIDENED_FIELD_TYPES: dict[str, tuple[type, ...]] = {
 def _runtime_types(declared: Any) -> tuple[type, ...]:
     """Runtime-checkable base classes for a dataclass field annotation.
 
-    Unwraps unions (``str | None``) and generic aliases (``list[str]`` -> ``list``);
-    ``None`` is dropped because callers handle the tombstone separately. Returns an
-    empty tuple for anything not reducible to concrete classes, which the callers
-    read as "no type contract to enforce".
+    Unwraps unions (``str | None``), generic aliases (``list[str]`` -> ``list``)
+    and ``Literal`` values (``Literal["a", "b"]`` -> ``str``); ``None`` is dropped
+    because callers handle the tombstone separately. Returns an empty tuple for
+    anything not reducible to concrete classes, which the callers read as "no
+    type contract to enforce".
     """
     if declared is type(None):
         return ()
     origin = get_origin(declared)
+    if origin is Literal:
+        return tuple(dict.fromkeys(type(value) for value in get_args(declared) if value is not None))
     if origin in (Union, UnionType):
         return tuple(t for arg in get_args(declared) for t in _runtime_types(arg))
     if origin is not None:

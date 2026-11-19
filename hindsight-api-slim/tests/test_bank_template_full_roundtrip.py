@@ -136,6 +136,7 @@ _SAMPLE_VALUES: dict[str, Any] = {
     "consolidation_use_decision_model": False,
     "consolidation_max_memories_per_round": 42,
     "consolidation_llm_parallelism": 3,
+    "observation_marking_page_stale": "tag_wide",
     "recall_include_chunks": True,
     "recall_prefer_observations": True,
     "recall_decision_model_prune": True,
@@ -335,6 +336,8 @@ _SAMPLE_MENTAL_MODELS: list[dict[str, Any]] = [
             "reflect_search_observations_include_entities": False,
             "response_schema": {"type": "object", "properties": {"summary": {"type": "string"}}},
             "keep_trace": True,
+            "staleness_check": "graph",
+            "graph_stale": "read_memories",
         },
     },
     {
