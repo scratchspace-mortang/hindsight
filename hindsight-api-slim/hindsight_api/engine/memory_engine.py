@@ -2404,6 +2404,52 @@ def _read_memory_ids_from_tool_trace(tool_trace: list[ToolCallTrace]) -> list[st
     return ids
 
 
+async def page_marks_read(
+    conn, *, bank_id: str, pages: "Sequence[tuple[str, int | None]]"
+) -> dict[str, bool]:
+    """C10: which of ``pages`` carry a page mark newer than their baseline.
+
+    Each pair is a page id and the provenance baseline its refresh stamped, or
+    ``None`` when no baseline was stamped. A page whose baseline is ``None``
+    answers False: a mark written before a page's first refresh cannot be
+    ordered against it, and that refresh stamps the baseline (the accepted
+    ordering limitation in the skeleton and spec, not a defect).
+
+    The read sits above the ``staleness_check`` branch in the two staleness
+    entry points, so a tagscope page and a graph page both answer it. On Oracle
+    change records do not exist, so it answers False for every page and issues
+    no statement. Otherwise it issues one statement for the whole batch, never
+    one per page. ``PAGE_MARK`` is the event type the writer in M5 declares;
+    this module does not import M5 (the skeleton forbids that dependency), so
+    the literal is repeated here.
+    """
+    answers = {str(page_id): False for page_id, _ in pages}
+    if _is_oracle() or getattr(conn, "backend_type", "postgresql") != "postgresql":
+        return answers
+    ordered = [(str(page_id), baseline) for page_id, baseline in pages if isinstance(baseline, int)]
+    if not ordered:
+        return answers
+    rows = await conn.fetch(
+        f"""
+        SELECT requested.page_id
+        FROM unnest($1::text[], $2::bigint[]) AS requested(page_id, baseline)
+        WHERE EXISTS (
+            SELECT 1 FROM {fq_table("memory_change_events")} e
+            WHERE e.bank_id = $3
+              AND e.event_type = 'PAGE_MARK'
+              AND e.detail->>'page_id' = requested.page_id
+              AND e.seq > requested.baseline
+        )
+        """,
+        [page_id for page_id, _ in ordered],
+        [baseline for _, baseline in ordered],
+        bank_id,
+    )
+    for row in rows:
+        answers[row["page_id"]] = True
+    return answers
+
+
 def _graph_staleness_settings(trigger: Any) -> tuple[str, str]:
     """``(staleness_check, graph_stale)`` from a stored trigger, with defaults.
 
@@ -22032,6 +22078,33 @@ class MemoryEngine(MemoryEngineInterface):
         the page stale; missing provenance fails closed.
         """
         staleness_check, graph_stale = _graph_staleness_settings(_mm_row_field(mm_row, "trigger"))
+
+        # C10 sits above the staleness_check branch: a durable page mark newer
+        # than this page's baseline is stale in tagscope mode and in graph
+        # mode alike. The provenance rule below still adds its own signals.
+        if getattr(conn, "backend_type", "postgresql") == "postgresql":
+            page_id = _mm_row_field(mm_row, "id")
+            if page_id is not None:
+                try:
+                    reflect_response = mm_row["reflect_response"]
+                except (KeyError, IndexError, TypeError):
+                    reflect_response = None
+                if reflect_response is None:
+                    stamped = await conn.fetchrow(
+                        f"SELECT reflect_response FROM {fq_table('mental_models')} "
+                        f"WHERE bank_id = $1 AND id = $2",
+                        bank_id,
+                        page_id,
+                    )
+                    reflect_response = stamped["reflect_response"] if stamped else None
+                prov = _graph_provenance(reflect_response)
+                baseline = prov.get("baseline_seq") if prov else None
+                if not isinstance(baseline, int):
+                    baseline = None
+                marked = await page_marks_read(conn, bank_id=bank_id, pages=[(str(page_id), baseline)])
+                if marked.get(str(page_id)):
+                    return True
+
         if staleness_check == "graph" and getattr(conn, "backend_type", "postgresql") == "postgresql":
             return await self._compute_graph_is_stale(conn, bank_id, mm_row, graph_stale=graph_stale)
         # On a non-Postgres backend there is no change-record table, so there
@@ -22371,6 +22444,18 @@ class MemoryEngine(MemoryEngineInterface):
                     conn=conn, fq_table=fq_table, bank_id=bank_id, scopes=pending
                 )
             )
+
+        # C10 for the batch path: one page-mark statement for the whole batch,
+        # above every staleness_check branch. A newer mark overrides the bank
+        # watermark shortcut and the scope answer, in both modes.
+        marked = await page_marks_read(
+            conn,
+            bank_id=bank_id,
+            pages=[(key, prov.baseline_seq) for key, prov in prov_map.items()],
+        )
+        for key, is_marked in marked.items():
+            if is_marked:
+                answers[key] = True
         return answers
 
     def _row_to_mental_model(self, row, *, detail: str = "full") -> dict[str, Any]:

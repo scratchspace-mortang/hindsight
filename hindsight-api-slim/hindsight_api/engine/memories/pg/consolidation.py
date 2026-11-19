@@ -22,10 +22,12 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
 
 #: Change-record event types: TEXT_CHANGE for a consolidation text rewrite,
 #: FOLD_IN for a new source id on a read observation, SRC_EDIT for a
-#: source-memory edit/refine/supersede/invalidate.
+#: source-memory edit/refine/supersede/invalidate, PAGE_MARK for the durable
+#: page mark written by the observation page check (T7).
 TEXT_CHANGE = "TEXT_CHANGE"
 FOLD_IN = "FOLD_IN"
 SRC_EDIT = "SRC_EDIT"
+PAGE_MARK = "PAGE_MARK"
 
 
 def _is_postgres(conn) -> bool:
@@ -204,6 +206,83 @@ async def record_change_event(
         after_text,
         json.dumps(detail) if detail is not None else None,
     )
+
+
+async def record_page_marks(conn, *, bank_id: str, marks) -> int:
+    """Write the durable page marks of one observation page check (C9).
+
+    ``marks`` is a set of ``(observation_id, page_id)`` pairs. The subject of
+    each record is the checked-set observation, never the page: a page id is
+    text and ``subject_id`` is cast through ``uuid.UUID`` in the writer below,
+    so a page subject raises instead of storing the wrong kind of id. The page
+    id lives in ``detail`` together with the stable event identity, which is
+    derived from the (observation, page) pair: a retry of a durable pair mints
+    the same id and inserts nothing, while a retry after an aborted attempt has
+    no durable row to conflict with.
+
+    The whole set is written in one short transaction under the existing
+    per-bank advisory lock, the same xact-scoped lock a page baseline capture
+    uses, so each mark's ``seq`` is ordered against any baseline captured under
+    that lock. ``record_change_event`` re-acquires the same lock, which is
+    reentrant inside one transaction; no second lock is introduced. With no
+    transaction open the writer fails loud, exactly as the change-record
+    writer does, because an autocommitting lock would buy no ordering.
+
+    Returns the number of rows this call actually inserted. The pre-check that
+    counts is itself under the lock, so a concurrent bank writer cannot make a
+    call report an insert that the ``ON CONFLICT`` clause then suppressed.
+    That clause is the second line of defence, not the identity mechanism.
+    """
+    from ...schema import _is_oracle, fq_table  # noqa: PLC0415
+
+    if _is_oracle() or not _is_postgres(conn):
+        return 0
+    in_transaction = getattr(conn, "in_transaction", None) or getattr(conn, "is_in_transaction", None)
+    if callable(in_transaction) and not in_transaction():
+        raise RuntimeError(
+            "record_page_marks requires an open transaction: the per-bank advisory lock "
+            "serializing page marks against page baselines only holds inside one"
+        )
+
+    by_event_id = {}
+    for observation_id, page_id in marks:
+        detail = {"page_id": page_id}
+        event_id = _derived_event_id(
+            bank_id=bank_id,
+            subject_id=observation_id,
+            event_type=PAGE_MARK,
+            before_text=None,
+            after_text=None,
+            detail=detail,
+        )
+        by_event_id[event_id] = (str(observation_id), detail)
+    pairs = sorted(by_event_id.items())
+
+    await conn.execute("SELECT pg_advisory_xact_lock(hashtext($1)::bigint)", bank_id)
+    durable = await conn.fetch(
+        f"SELECT event_id FROM {fq_table('memory_change_events')} "
+        f"WHERE bank_id = $1 AND event_id = ANY($2::text[])",
+        bank_id,
+        [event_id for event_id, _ in pairs],
+    )
+    already = {row["event_id"] for row in durable}
+    inserted = 0
+    for event_id, (observation_id, detail) in pairs:
+        if event_id in already:
+            continue
+        await record_change_event(
+            conn=conn,
+            fq_table=fq_table,
+            bank_id=bank_id,
+            subject_id=observation_id,
+            event_type=PAGE_MARK,
+            event_id=event_id,
+            before_text=None,
+            after_text=None,
+            detail=detail,
+        )
+        inserted += 1
+    return inserted
 
 
 def _search_vector_clause(param: str) -> str:
