@@ -66,7 +66,7 @@ from ..llm_trace import (
 from ..llm_wrapper import reask_messages, sanitize_llm_output
 from ..memories import StoredMemory, get_memories
 from ..memories.pg.consolidation import record_page_marks
-from ..memory_engine import page_shortlist
+from ..memory_engine import _page_check_backend_postgresql, page_shortlist
 from ..response_models import Budget
 from ..retain import embedding_utils
 from ..schema import fq_table
@@ -348,7 +348,7 @@ async def decide_page_marks(
     return frozenset(selected)
 
 
-async def run_observation_page_check(
+async def _run_observation_page_check_steps(
     *,
     bank_id: str,
     created: Mapping[str, list[str]],
@@ -358,13 +358,11 @@ async def run_observation_page_check(
     llm_config: Any | None = None,
     conn: Any | None = None,
 ) -> PageCheckOutcome:
-    """C6: one page check for one consolidation job's checked set.
+    """C6's steps, unchanged by T8: one query, one search per subject, one call, one transaction.
 
-    The caller supplies the run's created set after the fold substitution and calls
-    this once at the job tail, after the last batch committed and before the
-    ``hit_round_limit`` gate. Text and tags for all subjects come from one query;
-    each subject then gets one shortlist search, and the job gets one decision call
-    and one short mark transaction. T8 wraps this seam for fail-open and Oracle.
+    The caller supplies the run's created set after the fold substitution. This
+    function raises on an ordinary failure at any step; the public
+    :func:`run_observation_page_check` is the fail-open boundary around it.
     """
     checked = {str(obs): list(sources) for obs, sources in created.items()}
     if not checked:
@@ -378,6 +376,10 @@ async def run_observation_page_check(
         active_conn = conn
         if active_conn is None:
             active_conn = await stack.enter_async_context(acquire_with_retry(memory_engine._backend))
+        # Oracle has no change records or mark writer. Skip here, before the
+        # first shortlist search spends an embedding (R16, model P8).
+        if not _page_check_backend_postgresql(active_conn):
+            return PageCheckOutcome(ran=False, selected=frozenset(), marks_written=0)
         subjects = await get_memories().get_memories(
             conn=active_conn, fq_table=fq_table, bank_id=bank_id, unit_ids=list(checked)
         )
@@ -407,6 +409,46 @@ async def run_observation_page_check(
         async with active_conn.transaction():
             written = await record_page_marks(conn=active_conn, bank_id=bank_id, marks=selected)
     return PageCheckOutcome(ran=True, selected=selected, marks_written=written)
+
+
+async def run_observation_page_check(
+    *,
+    bank_id: str,
+    created: Mapping[str, list[str]],
+    config: Any,
+    request_context: Any,
+    memory_engine: "MemoryEngine",
+    llm_config: Any | None = None,
+    conn: Any | None = None,
+) -> PageCheckOutcome:
+    """C6's fail-open boundary around the one-per-job check (R14, machine 2 P3).
+
+    Every ordinary failure, at any of the five steps, is logged and returns a
+    no-op outcome so the consolidation job keeps its own already-committed
+    writes and writes no page marks. Cancellation and KeyboardInterrupt are not
+    check failures: they are re-raised untouched so a cancelled job still
+    cancels. A failed attempt never leaves a partial mark set: the steps write
+    the selected pairs in one short transaction, so an abort leaves none.
+    """
+    try:
+        return await _run_observation_page_check_steps(
+            bank_id=bank_id,
+            created=created,
+            config=config,
+            request_context=request_context,
+            memory_engine=memory_engine,
+            llm_config=llm_config,
+            conn=conn,
+        )
+    except (asyncio.CancelledError, KeyboardInterrupt):
+        raise
+    except Exception:
+        logger.warning(
+            "[CONSOLIDATION] bank=%s page check failed open; job writes are kept and no page marks were written",
+            bank_id,
+            exc_info=True,
+        )
+        return PageCheckOutcome(ran=False, selected=frozenset(), marks_written=0)
 
 
 _DEDUP_PROMPT = """You reconcile long-term memory observations. A NEW observation is about to be \

@@ -2410,6 +2410,20 @@ def _read_memory_ids_from_tool_trace(tool_trace: list[ToolCallTrace]) -> list[st
     return ids
 
 
+def _page_check_backend_postgresql(conn: Any) -> bool:
+    """R16's backend gate, read from the same facts the graph rule and C10 use.
+
+    Change records and the page-mark writer exist only on PostgreSQL, so the
+    job-tail check is skipped on Oracle before it embeds or searches anything.
+    The graph staleness rule asks ``getattr(conn, "backend_type", "postgresql")
+    == "postgresql"`` and C10's mark read adds ``not _is_oracle()``; this reads
+    those same two facts in one place for the check, so the skip cannot drift
+    from either of them. A connection double with no backend field reads as
+    PostgreSQL, matching the graph rule's default.
+    """
+    return not _is_oracle() and getattr(conn, "backend_type", "postgresql") == "postgresql"
+
+
 async def page_marks_read(
     conn, *, bank_id: str, pages: "Sequence[tuple[str, int | None]]"
 ) -> dict[str, bool]:
