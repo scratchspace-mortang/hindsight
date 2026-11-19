@@ -200,6 +200,37 @@ class _CountingConn:
         return None
 
 
+class _ReflectFetchConn(_CountingConn):
+    """A counting conn that answers the narrow-row reflect_response SELECT.
+
+    It records every statement and returns a stamped reflect_response for the
+    mental_models lookup, so a single narrow-row staleness check can be counted
+    by how many times it reads reflect_response (round 31 A).
+    """
+
+    def __init__(self, reflect_response: str) -> None:
+        super().__init__()
+        self.reflect_response = reflect_response
+
+    def reflect_fetch_count(self) -> int:
+        return sum(
+            "SELECT reflect_response" in s and "mental_models" in s
+            for s in self.statements
+        )
+
+    async def fetchrow(self, sql, *args, **kwargs):
+        await super().fetchrow(sql, *args, **kwargs)
+        if "reflect_response" in sql and "mental_models" in sql:
+            return {"reflect_response": self.reflect_response}
+        return None
+
+    async def fetchval(self, sql, *args, **kwargs):
+        await super().fetchval(sql, *args, **kwargs)
+        if "reflect_response" in sql and "mental_models" in sql:
+            return self.reflect_response
+        return None
+
+
 # ---------------------------------------------------------------------------
 # C9, P4: the writer, its subject and its identity
 # ---------------------------------------------------------------------------
@@ -322,6 +353,37 @@ async def test_page_mark_write_accepts_uuid_page_id():
     assert len(conn.insert_args) == 1
     detail = json.loads(conn.insert_args[0][-1])
     assert detail == {"page_id": str(page_uuid)}
+
+
+@pytest.mark.asyncio
+async def test_page_mark_write_noncanonical_observation_id_collapses_to_one_row():
+    """Two textual forms of one observation id are one (observation, page) pair.
+
+    round 31 B: the event id must be derived from the canonical observation id,
+    the same form the insert casts through uuid.UUID, otherwise mixed-case and
+    braced spellings of one uuid mint two durable rows for one mark. This is the
+    observation-side counterpart of the page-id half fixed in round 30 F3.
+    """
+    u = uuid.uuid4()
+    forms = {str(u), str(u).upper(), "{" + str(u) + "}"}
+
+    class _ArgConn(_CountingConn):
+        def __init__(self):
+            super().__init__()
+            self.insert_args = []
+
+        async def execute(self, sql, *args, **kwargs):
+            await super().execute(sql, *args, **kwargs)
+            if "INSERT INTO" in sql:
+                self.insert_args.append(args)
+
+    conn = _ArgConn()
+    inserted = await pg_con.record_page_marks(
+        conn=conn, bank_id="bank", marks=frozenset((obs, "p") for obs in forms)
+    )
+    assert inserted == 1
+    assert len(conn.insert_args) == 1
+    assert conn.insert_args[0][2] == u  # the stored subject is the canonical uuid
 
 
 @pytest.mark.asyncio
@@ -808,6 +870,65 @@ async def test_page_mark_single_fallback_select_when_reflect_response_absent(mem
     await memory.compute_mental_model_is_stale(conn, "bank", row)
     fallback = [s for s in conn.statements if "reflect_response" in s and "SELECT" in s]
     assert fallback, "the fallback SELECT for reflect_response must run"
+
+
+@pytest.mark.asyncio
+async def test_page_mark_single_graph_row_fetches_reflect_once(memory):
+    """A narrow graph-mode row must read reflect_response exactly once.
+
+    round 31 A: the C10 block fetches the stamped reflect_response to find the
+    page-mark baseline, then _compute_graph_is_stale fetches the same column
+    again. One narrow-row check must pay for one lookup, while other callers of
+    that helper keep their own fallback.
+    """
+    rr = json.dumps(
+        {
+            "text": "page",
+            "mental_models": [],
+            "graph_provenance": {
+                "baseline_seq": 5,
+                "read_memory_ids": [],
+                "captured_empty": True,
+                "cited_empty": True,
+            },
+        }
+    )
+    conn = _ReflectFetchConn(rr)
+    row = {
+        "id": "page-graph",
+        "tags": [],
+        "trigger": {
+            "mode": "full",
+            "refresh_after_consolidation": True,
+            "staleness_check": "graph",
+            "graph_stale": "cited_memories",
+        },
+        "last_refreshed_at": None,
+        "last_memory_seen_at": None,
+    }
+    await memory.compute_mental_model_is_stale(conn, "bank", row)
+    assert conn.reflect_fetch_count() == 1
+
+
+@pytest.mark.asyncio
+async def test_page_mark_single_tagscope_row_fetches_reflect_once(memory):
+    """A narrow tagscope-mode row must also read reflect_response exactly once.
+
+    round 31 A: here the second lookup is in _cited_fact_ids rather than in the
+    graph helper. Both single-path seams share the value the C10 block already
+    fetched, and each is pinned by its own counting test.
+    """
+    rr = json.dumps({"text": "page", "mental_models": [], "based_on": {}})
+    conn = _ReflectFetchConn(rr)
+    row = {
+        "id": "page-tagscope",
+        "tags": [],
+        "trigger": {"mode": "full", "refresh_after_consolidation": True},
+        "last_refreshed_at": datetime.now(timezone.utc),
+        "last_memory_seen_at": datetime.now(timezone.utc),
+    }
+    await memory.compute_mental_model_is_stale(conn, "bank", row)
+    assert conn.reflect_fetch_count() == 1
 
 
 # ---------------------------------------------------------------------------

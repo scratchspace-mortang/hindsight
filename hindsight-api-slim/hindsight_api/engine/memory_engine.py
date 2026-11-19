@@ -2376,6 +2376,12 @@ def _count_retrieved_facts(tool_trace: list[ToolCallTrace]) -> dict[str, int]:
 _GRAPH_PROVENANCE_KEY = "graph_provenance"
 
 
+#: Marks "the caller has not already resolved reflect_response" for the graph
+#: and cited-id helpers. A resolved value, including None, is passed explicitly
+#: so the single narrow-row path never issues the same SELECT twice (round 31 A).
+_REFLECT_UNSET = object()
+
+
 def _read_memory_ids_from_tool_trace(tool_trace: list[ToolCallTrace]) -> list[str]:
     """Memory ids a refresh's tool calls handed back, deduplicated in order.
 
@@ -21928,7 +21934,15 @@ class MemoryEngine(MemoryEngineInterface):
                     prev_read_ids = [mid for mid in prev_read_ids if mid in live_ids]
         return int(value or 0), prev_read_ids
 
-    async def _compute_graph_is_stale(self, conn, bank_id: str, mm_row: Any, *, graph_stale: str) -> bool:
+    async def _compute_graph_is_stale(
+        self,
+        conn,
+        bank_id: str,
+        mm_row: Any,
+        *,
+        graph_stale: str,
+        reflect_response: Any = _REFLECT_UNSET,
+    ) -> bool:
         """The graph-mode staleness rule.
 
         True exactly when a durable change record newer than the page's
@@ -21940,20 +21954,27 @@ class MemoryEngine(MemoryEngineInterface):
         edges beyond that hop are never traversed. No scope or watermark
         question is asked: a bare bump or a NEW_UNLINKED memory records
         nothing, so neither marks the page stale.
+
+        ``reflect_response`` lets the single-model caller pass the value it
+        already fetched for the C10 page-mark read, so this rule does not
+        issue a second SELECT for the same column. Callers that do not pass
+        it (the batch provenance path and direct callers) keep the row lookup
+        and the narrow-row fallback below.
         """
         mental_model_id = _mm_row_field(mm_row, "id")
-        reflect_response = _mm_row_field(mm_row, "reflect_response")
-        if reflect_response is None:
-            if mental_model_id is None:
-                return True
-            row = await conn.fetchrow(
-                f"SELECT reflect_response FROM {fq_table('mental_models')} WHERE bank_id = $1 AND id = $2",
-                bank_id,
-                mental_model_id,
-            )
-            if row is None:
-                return True
-            reflect_response = row["reflect_response"]
+        if reflect_response is _REFLECT_UNSET:
+            reflect_response = _mm_row_field(mm_row, "reflect_response")
+            if reflect_response is None:
+                if mental_model_id is None:
+                    return True
+                row = await conn.fetchrow(
+                    f"SELECT reflect_response FROM {fq_table('mental_models')} WHERE bank_id = $1 AND id = $2",
+                    bank_id,
+                    mental_model_id,
+                )
+                if row is None:
+                    return True
+                reflect_response = row["reflect_response"]
         if isinstance(reflect_response, str):
             try:
                 reflect_response = json.loads(reflect_response)
@@ -22079,6 +22100,9 @@ class MemoryEngine(MemoryEngineInterface):
         the page stale; missing provenance fails closed.
         """
         staleness_check, graph_stale = _graph_staleness_settings(_mm_row_field(mm_row, "trigger"))
+        # Resolved once by the C10 block below when this is a narrow row, then
+        # shared with the graph and cited-id rules so neither re-reads it.
+        reflect_response = _REFLECT_UNSET
 
         # C10 sits above the staleness_check branch: a durable page mark newer
         # than this page's baseline is stale in tagscope mode and in graph
@@ -22107,7 +22131,9 @@ class MemoryEngine(MemoryEngineInterface):
                     return True
 
         if staleness_check == "graph" and getattr(conn, "backend_type", "postgresql") == "postgresql":
-            return await self._compute_graph_is_stale(conn, bank_id, mm_row, graph_stale=graph_stale)
+            return await self._compute_graph_is_stale(
+                conn, bank_id, mm_row, graph_stale=graph_stale, reflect_response=reflect_response
+            )
         # On a non-Postgres backend there is no change-record table, so there
         # is no graph verdict to ask: the page falls through to the scope
         # rule below, exactly as the batch path answers it there; batch and
@@ -22137,30 +22163,38 @@ class MemoryEngine(MemoryEngineInterface):
         # fires.
         from .memories import get_memories
 
-        cited_ids = await self._cited_fact_ids(conn, bank_id, mm_row)
+        cited_ids = await self._cited_fact_ids(conn, bank_id, mm_row, reflect_response=reflect_response)
         return await get_memories().mental_model_is_stale(
             conn=conn, fq_table=fq_table, bank_id=bank_id, scope=scope, cited_ids=cited_ids
         )
 
-    async def _cited_fact_ids(self, conn, bank_id: str, mm_row: Any) -> list[str]:
+    async def _cited_fact_ids(
+        self, conn, bank_id: str, mm_row: Any, *, reflect_response: Any = _REFLECT_UNSET
+    ) -> list[str]:
         """The memory ids the model's stored grounding cites.
 
         Read off ``mm_row`` when the caller selected ``reflect_response`` (the full
         read does), else fetched, so the staleness callers that keep a narrow SELECT
         still work. Scope filters are irrelevant: a fact this document was actually
         built on is in scope by construction, whatever the model's tags say now.
+
+        The single-model caller passes the value the C10 page-mark read already
+        fetched, avoiding a second SELECT for the same column. Callers that do
+        not pass it (_has_retracted_grounding and direct callers) keep the row
+        lookup and the narrow-row fallback below.
         """
-        try:
-            reflect_response = mm_row["reflect_response"]
-        except (KeyError, IndexError, TypeError):
-            mental_model_id = _mm_row_field(mm_row, "id")
-            if mental_model_id is None:
-                return []
-            reflect_response = await conn.fetchval(
-                f"SELECT reflect_response FROM {fq_table('mental_models')} WHERE bank_id = $1 AND id = $2",
-                bank_id,
-                mental_model_id,
-            )
+        if reflect_response is _REFLECT_UNSET:
+            try:
+                reflect_response = mm_row["reflect_response"]
+            except (KeyError, IndexError, TypeError):
+                mental_model_id = _mm_row_field(mm_row, "id")
+                if mental_model_id is None:
+                    return []
+                reflect_response = await conn.fetchval(
+                    f"SELECT reflect_response FROM {fq_table('mental_models')} WHERE bank_id = $1 AND id = $2",
+                    bank_id,
+                    mental_model_id,
+                )
         if isinstance(reflect_response, str):
             try:
                 reflect_response = json.loads(reflect_response)

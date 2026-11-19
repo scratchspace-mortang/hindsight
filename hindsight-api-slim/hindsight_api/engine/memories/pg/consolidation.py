@@ -246,6 +246,12 @@ async def record_page_marks(conn, *, bank_id: str, marks) -> int:
 
     by_event_id = {}
     for observation_id, page_id in marks:
+        # The subject is stored as uuid.UUID(str(...)) in record_change_event, so
+        # derive the identity from that same canonical form. Otherwise a
+        # mixed-case or braced spelling of one observation mints a second event
+        # id for a pair that already has a durable row (round 31 B). The page id
+        # stays text and keeps F3's str()/default=str handling.
+        observation_id = str(uuid.UUID(str(observation_id)))
         detail = {"page_id": str(page_id)}
         event_id = _derived_event_id(
             bank_id=bank_id,
@@ -255,7 +261,7 @@ async def record_page_marks(conn, *, bank_id: str, marks) -> int:
             after_text=None,
             detail=detail,
         )
-        by_event_id[event_id] = (str(observation_id), detail)
+        by_event_id[event_id] = (observation_id, detail)
     pairs = sorted(by_event_id.items())
     if not pairs:
         # No mark to write: skip the xact-scoped lock and the pre-check SELECT
