@@ -170,7 +170,11 @@ def _decision_returning(pairs: set[tuple[str, str]]):
 
 @pytest.mark.asyncio
 async def test_page_shortlist_drops_snippet_and_body(monkeypatch):
-    """Only (page id, source_query) leaves the seam; snippet and page body do not."""
+    """Only (canonical page id, source_query) leaves; snippet and body do not.
+
+    The canonical page id is the backing mental-model id, not the knowledge-page
+    node id, because both staleness readers query the mental-model id.
+    """
     snippet = "SNIPPET-MUST-NOT-REACH-DECISION"
     body = "BODY-MUST-NOT-REACH-DECISION"
 
@@ -179,6 +183,7 @@ async def test_page_shortlist_drops_snippet_and_body(monkeypatch):
             return [
                 {
                     "id": "kp-1",
+                    "mental_model_id": "mm-1",
                     "source_query": PAGE_QUESTION,
                     "snippet": snippet,
                     "content": body,
@@ -194,7 +199,7 @@ async def test_page_shortlist_drops_snippet_and_body(monkeypatch):
         scope="bank_wide",
         request_context=SimpleNamespace(),
     )
-    assert shortlist == [("kp-1", PAGE_QUESTION)]
+    assert shortlist == [("mm-1", PAGE_QUESTION)]
     assert snippet not in repr(shortlist)
     assert body not in repr(shortlist)
 
@@ -211,7 +216,7 @@ async def test_page_shortlist_scope_and_one_embedding_one_search(monkeypatch):
     class _Engine:
         async def search_pages(self, bank_id, query, *, limit, tag_filter, request_context):
             seen.append((bank_id, query, tag_filter, limit))
-            return [{"id": "kp-1", "source_query": PAGE_QUESTION, "snippet": "s"}]
+            return [{"id": "kp-1", "mental_model_id": "mm-1", "source_query": PAGE_QUESTION, "snippet": "s"}]
 
     engine = _Engine()
     wide = await memory_engine_mod.page_shortlist(
@@ -230,7 +235,7 @@ async def test_page_shortlist_scope_and_one_embedding_one_search(monkeypatch):
         scope="tag_wide",
         request_context=SimpleNamespace(),
     )
-    assert wide == scoped == [("kp-1", PAGE_QUESTION)]
+    assert wide == scoped == [("mm-1", PAGE_QUESTION)]
     assert len(seen) == 2
     assert seen[0][2] is None
     assert isinstance(seen[1][2], memory_engine_mod.PageTagFilter)

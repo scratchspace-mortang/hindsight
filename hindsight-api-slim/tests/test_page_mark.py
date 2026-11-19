@@ -613,6 +613,89 @@ async def test_page_mark_read_batch_agrees_with_single(memory, request_context):
     await memory.delete_bank(bank_id, request_context=request_context)
 
 
+@pytest.mark.asyncio
+async def test_page_mark_kp_shortlist_id_is_read_stale_by_mm_id_readers(memory, request_context):
+    """A mark whose page id came from the kp page path must reach both readers.
+
+    The real producer is ``page_shortlist`` over a ``search_pages`` row: that row
+    carries a ``kp-...`` node ``id`` and the backing ``mental_model_id``. Both
+    staleness readers query the backing mental-model id. Keeping the kp id as the
+    shortlist identity writes an invisible mark, so this pins the whole producer
+    to consumer chain, not only the writer or only one reader.
+    """
+    from hindsight_api.engine.memory_engine import _mental_model_stale_scope
+
+    bank_id = f"test-pm-identity-{uuid.uuid4().hex[:8]}"
+    kp_id = f"kp-{uuid.uuid4().hex}"
+    await _ensure_bank(memory, bank_id, request_context)
+    pool = await memory._get_pool()
+    async with pool.acquire() as conn:
+        obs = await _insert_observation(conn, bank_id, "Identity subject.")
+        mm_id = await _create_page(memory, bank_id, request_context, staleness_check="tagscope")
+        baseline = await _max_seq(conn, bank_id)
+        await _stamp_baseline(conn, bank_id, mm_id, baseline)
+        assert await _is_stale(memory, conn, bank_id, mm_id) is False
+
+        class _Engine:
+            """One search_pages-shaped row with a kp id and its backing mm id."""
+
+            async def search_pages(self, bank_id, query, *, limit, tag_filter, request_context):
+                return [
+                    {
+                        "id": kp_id,
+                        "name": "Expense tooling page",
+                        "mental_model_id": mm_id,
+                        "source_query": "What tooling do we use for expenses?",
+                        "snippet": "SNIPPET",
+                        "score": 1.0,
+                        "updated_at": None,
+                    }
+                ]
+
+        shortlist = await memory_engine_mod.page_shortlist(
+            memory_engine=_Engine(),
+            bank_id=bank_id,
+            observation_text="An observation about expense tooling.",
+            observation_tags=[],
+            scope="bank_wide",
+            request_context=request_context,
+        )
+        written_marks = await _write_marks(
+            conn, bank_id, frozenset({(str(obs), shortlist[0][0])})
+        )
+        assert written_marks == 1
+
+        # The shared read seam, keyed the way both staleness readers key it.
+        marked = await page_marks_read(conn, bank_id=bank_id, pages=[(mm_id, baseline)])
+        assert marked[mm_id] is True
+
+        # Single reader.
+        assert await _is_stale(memory, conn, bank_id, mm_id) is True
+
+        # Batch reader, keyed by the mental-model id as the page tree is.
+        row = await conn.fetchrow(
+            f"SELECT id, tags, trigger, last_memory_seen_at, last_refreshed_at "
+            f"FROM {fq_store_table('mental_models')} WHERE bank_id=$1 AND id=$2",
+            bank_id,
+            mm_id,
+        )
+        scopes = {
+            mm_id: _mental_model_stale_scope(
+                key=mm_id,
+                tags=row["tags"],
+                trigger=row["trigger"],
+                last_memory_seen_at=row["last_memory_seen_at"],
+                last_refreshed_at=row["last_refreshed_at"],
+            )
+        }
+        batch = await memory.compute_mental_models_are_stale(conn, bank_id, scopes)
+        assert batch[mm_id] is True
+
+        # The root cause itself: the shortlist must carry the canonical mm id.
+        assert shortlist[0][0] == mm_id
+    await memory.delete_bank(bank_id, request_context=request_context)
+
+
 # ---------------------------------------------------------------------------
 # U5: cost of the page-addressed read over a seeded 10k-row event table
 # ---------------------------------------------------------------------------

@@ -2480,8 +2480,11 @@ async def page_shortlist(
     request_context: Any,
     limit: int = 10,
 ) -> list[tuple[str, str]]:
-    """C7: one page search for one checked-set subject, keeping only id and question.
+    """C7: one page search for one checked-set subject, keeping id and question.
 
+    The id is the backing mental-model id that ``search_pages`` selects alongside
+    the knowledge-page node id: it is the canonical identity both staleness readers
+    query, so it is the one that reaches the decision call and the durable mark.
     ``search_pages`` embeds its own query string and accepts no precomputed embedding,
     so one call here is one embedding plus one search. ``bank_wide`` passes no tag
     filter (internal context is unscoped by default); ``tag_wide`` passes an explicit
@@ -2504,7 +2507,7 @@ async def page_shortlist(
         tag_filter=tag_filter,
         request_context=request_context,
     )
-    return [(str(row["id"]), str(row.get("source_query") or "")) for row in rows]
+    return [(str(row["mental_model_id"]), str(row.get("source_query") or "")) for row in rows]
 
 
 def _graph_staleness_settings(trigger: Any) -> tuple[str, str]:
