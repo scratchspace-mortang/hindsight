@@ -1005,8 +1005,11 @@ async def provenance_batch_read(
     # Page rows: mental-model ids first, knowledge-page ids through the
     # kp join for whatever did not resolve. Ids compare as text, so a
     # key that is not a UUID — or is a knowledge-page id — never fails
-    # the batch.
-    resolved: dict[str, tuple[Any, Any]] = {}
+    # the batch. Each resolved value also carries the canonical backing
+    # mental-model id: page marks name that id, so the batch C10 read must
+    # use it rather than a knowledge-page id (round 30 F8). It is exposed on
+    # ProvenanceBatch.page_id, which no other consumer reads.
+    resolved: dict[str, tuple[Any, Any, str]] = {}
     rows = await conn.fetch(
         f"SELECT id::text AS page_id, trigger, reflect_response FROM {mm_table} "
         f"WHERE bank_id = $1 AND id::text = ANY($2::text[])",
@@ -1014,11 +1017,12 @@ async def provenance_batch_read(
         pages,
     )
     for row in rows:
-        resolved[str(row["page_id"])] = (row["trigger"], row["reflect_response"])
+        resolved[str(row["page_id"])] = (row["trigger"], row["reflect_response"], str(row["page_id"]))
     leftover = [page_id for page_id in pages if page_id not in resolved]
     if leftover:
         rows = await conn.fetch(
-            f"SELECT kp.id AS page_id, mm.trigger AS trigger, mm.reflect_response AS reflect_response "
+            f"SELECT kp.id AS page_id, mm.id AS canonical_id, "
+            f"mm.trigger AS trigger, mm.reflect_response AS reflect_response "
             f"FROM {kp_table} kp "
             f"JOIN {mm_table} mm ON mm.bank_id = kp.bank_id AND mm.id::text = kp.mental_model_id "
             f"WHERE kp.bank_id = $1 AND kp.id = ANY($2::text[])",
@@ -1026,7 +1030,10 @@ async def provenance_batch_read(
             leftover,
         )
         for row in rows:
-            resolved.setdefault(str(row["page_id"]), (row["trigger"], row["reflect_response"]))
+            resolved.setdefault(
+                str(row["page_id"]),
+                (row["trigger"], row["reflect_response"], str(row["canonical_id"])),
+            )
 
     # Provenance ids per page, split by traversal set before any query:
     # the engine takes the max signal per mode, so the two sets stay
@@ -1034,7 +1041,7 @@ async def provenance_batch_read(
     per_page: dict[str, tuple[list[str], list[str] | None, Any, Any]] = {}
     all_provenance: list[uuid.UUID] = []
     for page_id in resolved:
-        trigger, reflect_response = resolved[page_id]
+        trigger, reflect_response, _canonical_id = resolved[page_id]
         parsed = _as_json(reflect_response)
         parsed = parsed if isinstance(parsed, dict) else {}
         based_on = parsed.get("based_on")
@@ -1114,7 +1121,8 @@ async def provenance_batch_read(
                 subjects.extend(_as_uuids(read_sources.get(pid, [])))
             event_rows = await conn.fetch(
                 f"SELECT subject_id, MAX(seq) AS max_seq FROM {fq_table('memory_change_events')} "
-                f"WHERE bank_id = $1 AND subject_id = ANY($2::uuid[]) GROUP BY subject_id",
+                f"WHERE bank_id = $1 AND subject_id = ANY($2::uuid[]) "
+                f"AND event_type <> 'PAGE_MARK' GROUP BY subject_id",
                 bank_id,
                 subjects,
             )
@@ -1128,7 +1136,9 @@ async def provenance_batch_read(
         (captured_empty, baseline_seq, cited_empty, _),
     ) in per_page.items():
         out[page_id] = ProvenanceBatch(
-            page_id=page_id,
+            # Canonical backing mental-model id, not the caller's page key:
+            # page marks name that id on both the single and the batch path.
+            page_id=resolved[page_id][2],
             trigger=resolved[page_id][0],
             cited_ids=list(cited_ids),
             based_on_present=based_on_present,

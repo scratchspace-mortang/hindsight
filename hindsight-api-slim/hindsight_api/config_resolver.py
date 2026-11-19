@@ -15,7 +15,7 @@ import logging
 from dataclasses import dataclass, fields, replace
 from functools import lru_cache
 from types import UnionType
-from typing import TYPE_CHECKING, Any, Union, get_args, get_origin
+from typing import TYPE_CHECKING, Any, Literal, Union, get_args, get_origin
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from hindsight_api.config import (
@@ -776,14 +776,17 @@ _WIDENED_FIELD_TYPES: dict[str, tuple[type, ...]] = {
 def _runtime_types(declared: Any) -> tuple[type, ...]:
     """Runtime-checkable base classes for a dataclass field annotation.
 
-    Unwraps unions (``str | None``) and generic aliases (``list[str]`` -> ``list``);
-    ``None`` is dropped because callers handle the tombstone separately. Returns an
-    empty tuple for anything not reducible to concrete classes, which the callers
-    read as "no type contract to enforce".
+    Unwraps unions (``str | None``), generic aliases (``list[str]`` -> ``list``)
+    and ``Literal`` values (``Literal["a", "b"]`` -> ``str``); ``None`` is dropped
+    because callers handle the tombstone separately. Returns an empty tuple for
+    anything not reducible to concrete classes, which the callers read as "no
+    type contract to enforce".
     """
     if declared is type(None):
         return ()
     origin = get_origin(declared)
+    if origin is Literal:
+        return tuple(dict.fromkeys(type(value) for value in get_args(declared) if value is not None))
     if origin in (Union, UnionType):
         return tuple(t for arg in get_args(declared) for t in _runtime_types(arg))
     if origin is not None:
@@ -803,6 +806,25 @@ def _configurable_field_types() -> dict[str, tuple[type, ...]]:
         if allowed:
             field_types[field.name] = allowed
     return field_types
+
+
+@lru_cache(maxsize=1)
+def _configurable_literal_values() -> dict[str, tuple[Any, ...]]:
+    """Map each configurable field declared as ``Literal`` to its accepted values.
+
+    ``_configurable_field_types`` deliberately reduces a ``Literal`` to its
+    value types (e.g. ``str``), which is right for the API's type report but
+    loses the membership contract. Reading the values from the annotation here
+    keeps the write door in parity with ``HindsightConfig.validate()``, which
+    the env door uses and which rejects anything outside the literal set.
+    """
+    configurable = HindsightConfig.get_configurable_fields()
+    literals: dict[str, tuple[Any, ...]] = {}
+    for field in fields(HindsightConfig):
+        if field.name not in configurable or get_origin(field.type) is not Literal:
+            continue
+        literals[field.name] = get_args(field.type)
+    return literals
 
 
 def _value_matches_type(value: Any, allowed: tuple[type, ...]) -> bool:
@@ -890,6 +912,7 @@ def _validate_config_value_types(updates: dict[str, Any]) -> None:
     the field and the expected type.
     """
     field_types = _configurable_field_types()
+    literal_values = _configurable_literal_values()
     for key, value in updates.items():
         allowed = field_types.get(key)
         # None is the "clear this override" tombstone; unknown keys are rejected
@@ -898,6 +921,10 @@ def _validate_config_value_types(updates: dict[str, Any]) -> None:
             continue
         if not _value_matches_type(value, allowed):
             raise ValueError(f"{key} must be {_describe_types(allowed)}, got {type(value).__name__}")
+        accepted = literal_values.get(key)
+        if accepted is not None and value not in accepted:
+            choices = ", ".join(str(option) for option in accepted)
+            raise ValueError(f"Invalid {key}: {value!r}. Must be one of: {choices}.")
 
 
 def _coerce_stored_bank_overrides(bank_id: str, overrides: dict[str, Any], where: str = "") -> dict[str, Any]:

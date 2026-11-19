@@ -274,6 +274,14 @@ class BankTemplateConfig(BaseModel):
     consolidation_llm_parallelism: int | None = Field(
         default=None, description="Number of consolidation LLM batches processed concurrently"
     )
+    # Page-check candidate scope, resolved once per bank at job start.
+    observation_marking_page_stale: Literal["bank_wide", "tag_wide"] | None = Field(
+        default=None,
+        description=(
+            "How a page check searches for stale candidates: 'bank_wide' searches the whole "
+            "bank, 'tag_wide' only the page's tags (default when unset)."
+        ),
+    )
     recall_include_chunks: bool | None = Field(default=None, description="Include raw chunks in recall results")
     recall_prefer_observations: bool | None = Field(
         default=None, description="Default for recall prefer_observations when the request omits it"

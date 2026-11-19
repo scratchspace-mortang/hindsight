@@ -1067,6 +1067,9 @@ ENV_PAGE_DEFAULT_TRIGGER = "HINDSIGHT_API_PAGE_DEFAULT_TRIGGER"
 # Deprecated name of ENV_PAGE_DEFAULT_TRIGGER, still read as a fallback. Remove in 2.x.
 ENV_PAGE_DEFAULT_TRIGGER_DEPRECATED = "HINDSIGHT_API_KNOWLEDGE_PAGE_DEFAULT_TRIGGER"
 ENV_REFLECT_DEFAULT_OPTIONS = "HINDSIGHT_API_REFLECT_DEFAULT_OPTIONS"
+# Which pages the observation page check may draw candidates from. This is a
+# bank-level value, never a field on the per-page trigger schema.
+ENV_OBSERVATION_MARKING_PAGE_STALE = "HINDSIGHT_API_OBSERVATION_MARKING_PAGE_STALE"
 
 # Webhook configuration (global, static - server-level only)
 ENV_WEBHOOK_URL = "HINDSIGHT_API_WEBHOOK_URL"
@@ -2132,6 +2135,9 @@ DEFAULT_MENTAL_MODEL_MIN_REFRESH_INTERVAL_SECONDS = 0
 # (MemoryEngine.PAGE_DEFAULT_TRIGGER) when a page is created; a request's
 # own trigger still wins. JSON object, e.g. {"refresh_cron": "0 * * * *"}.
 DEFAULT_PAGE_DEFAULT_TRIGGER: dict | None = None
+# Upstream default for the bank-level page-check candidate scope. Operators may
+# override it per bank; the code change itself keeps the upstream value.
+DEFAULT_OBSERVATION_MARKING_PAGE_STALE = "tag_wide"
 # Reflect options applied whenever a reflect request leaves them unset, e.g.
 # {"reflect_search_observations_max_tokens": 3000}. Fields are those of ReflectDefaultOptions;
 # an explicit request value always wins. Mental-model refreshes do not read it (they use their trigger).
@@ -4390,6 +4396,10 @@ class HindsightConfig:
     reflect_kb_search_max_images: int = DEFAULT_REFLECT_KB_SEARCH_MAX_IMAGES
     reflect_kb_search_budget: str = DEFAULT_REFLECT_KB_SEARCH_BUDGET
 
+    # Bank-level page-check candidate scope. Resolved once per bank at job start
+    # and shared by every search, so pages of one bank cannot disagree about it.
+    observation_marking_page_stale: Literal["bank_wide", "tag_wide"] = "tag_wide"
+
     # Class-level sets for configuration categorization
 
     # CREDENTIAL_FIELDS: Never exposed via API, never configurable per-tenant/bank
@@ -4516,6 +4526,8 @@ class HindsightConfig:
         "consolidation_use_decision_model",
         "consolidation_llm_batch_size",
         "consolidation_llm_parallelism",
+        # Page-check candidate scope: bank-level, resolved per bank at job start.
+        "observation_marking_page_stale",
         "consolidation_max_memories_per_round",
         "consolidation_source_facts_max_tokens",
         "consolidation_source_facts_max_tokens_per_observation",
@@ -4758,6 +4770,14 @@ class HindsightConfig:
             raise ValueError(
                 f"Invalid text_search_extension: {self.text_search_extension}. "
                 f"Must be one of: {', '.join(VALID_TEXT_SEARCH_EXTENSIONS)}"
+            )
+
+        # A typo here would silently widen or narrow every bank's candidate
+        # search, so reject it at load instead of defaulting or coercing it.
+        if self.observation_marking_page_stale not in ("bank_wide", "tag_wide"):
+            raise ValueError(
+                f"Invalid observation_marking_page_stale ({ENV_OBSERVATION_MARKING_PAGE_STALE}): "
+                f"{self.observation_marking_page_stale!r}. Must be one of: bank_wide, tag_wide."
             )
 
         # Validate text_search_extension_native_language as a PG identifier.
@@ -6009,6 +6029,10 @@ class HindsightConfig:
                         str(DEFAULT_CONSOLIDATION_LLM_PARALLELISM),
                     )
                 ),
+            ),
+            observation_marking_page_stale=cast(
+                'Literal["bank_wide", "tag_wide"]',
+                os.getenv(ENV_OBSERVATION_MARKING_PAGE_STALE, DEFAULT_OBSERVATION_MARKING_PAGE_STALE).lower(),
             ),
             consolidation_max_tokens=int(
                 os.getenv(ENV_CONSOLIDATION_MAX_TOKENS, str(DEFAULT_CONSOLIDATION_MAX_TOKENS))

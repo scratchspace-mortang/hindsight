@@ -798,6 +798,23 @@
           "description": "Number of consolidation LLM batches processed concurrently",
           "title": "Consolidation Llm Parallelism"
         },
+        "observation_marking_page_stale": {
+          "anyOf": [
+            {
+              "enum": [
+                "bank_wide",
+                "tag_wide"
+              ],
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "How a page check searches for stale candidates: 'bank_wide' searches the whole bank, 'tag_wide' only the page's tags (default when unset).",
+          "title": "Observation Marking Page Stale"
+        },
         "recall_include_chunks": {
           "anyOf": [
             {

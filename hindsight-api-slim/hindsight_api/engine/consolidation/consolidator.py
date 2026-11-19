@@ -24,7 +24,7 @@ import re
 import time
 import uuid
 from collections import defaultdict
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from contextlib import AsyncExitStack
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
@@ -65,6 +65,8 @@ from ..llm_trace import (
 )
 from ..llm_wrapper import reask_messages, sanitize_llm_output
 from ..memories import StoredMemory, get_memories
+from ..memories.pg.consolidation import record_page_marks
+from ..memory_engine import _page_check_backend_postgresql, page_shortlist
 from ..response_models import Budget
 from ..retain import embedding_utils
 from ..schema import fq_table
@@ -212,6 +214,241 @@ def _dedup_decision_from_response(raw: Any) -> _DedupDecision:
     except ValueError as exc:
         logger.warning("Invalid consolidation dedup response %r; defaulting to keep: %s", raw, exc)
         return _DedupDecision(action="keep", reason="invalid structured response")
+
+
+# ---------------------------------------------------------------------------
+# T6 (kata 1894): the once-per-job observation page check (C6, C7, C8).
+# The fail-open boundary and the Oracle skip (R14, R16) belong to T8, which wraps
+# this runner. Ordinary failures here raise into that boundary.
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class PageCheckOutcome:
+    """C6's result: whether the check ran, what it selected and how many marks committed."""
+
+    ran: bool
+    selected: frozenset[tuple[str, str]]
+    marks_written: int
+
+
+def _checked_set_after_folds(
+    created: Mapping[str, list[str]],
+    folds: Mapping[str, str],
+) -> dict[str, list[str]]:
+    """Apply R15's fold rule to a run's created set.
+
+    A created observation folded into a twin leaves the set and the surviving twin
+    enters it carrying the folded sources. The twin may predate the run, so it is
+    the one legal checked-set subject an earlier run created.
+    """
+    checked = {str(obs): list(sources) for obs, sources in created.items()}
+    for folded, twin in folds.items():
+        folded_id, twin_id = str(folded), str(twin)
+        sources = checked.pop(folded_id, [])
+        if sources or twin_id not in checked:
+            merged = list(dict.fromkeys([*checked.get(twin_id, []), *sources]))
+            checked[twin_id] = merged
+    return checked
+
+
+class _PageMarkBlock(BaseModel):
+    """One observation's block in the job's single decision answer."""
+
+    observation_id: str
+    page_ids: list[str] = Field(default_factory=list)
+
+
+class _PageMarkDecision(BaseModel):
+    """The whole job's answer: one block per checked-set observation."""
+
+    blocks: list[_PageMarkBlock] = Field(default_factory=list)
+
+
+_PAGE_MARK_PROMPT = """You decide which knowledge pages an observation marks.
+
+For each observation, a list of candidate pages is given as an id and the question
+the page answers. Mark a page when the observation answers that question, or when
+the observation is about the same topic. Mark more than one page if more than one
+qualifies. Mark no page when none qualifies.
+
+Answer with ONE JSON object of this shape, and nothing else:
+{{"blocks": [{{"observation_id": "O1", "page_ids": ["kp-a"]}}]}}
+
+Include only ids that appear in the block's candidate list. An id from another
+block, or an id that is not listed, must never be returned. Page bodies and
+snippets are deliberately not shown to you.
+
+{blocks}"""
+
+
+def _page_decision_from_response(raw: Any) -> _PageMarkDecision:
+    """Parse the one structured answer. A bad answer raises into T8's boundary.
+
+    A provider (or a test double) that returns a different already-structured
+    Pydantic model is answering no page question at all, so it is the empty answer
+    rather than an unparsable one. Raw text and dicts that miss the schema still
+    raise. This narrow parse rule is not T8's fail-open boundary: failures at any
+    other step still propagate to it.
+    """
+    if isinstance(raw, _PageMarkDecision):
+        return raw
+    if isinstance(raw, BaseModel):
+        return _PageMarkDecision()
+    if isinstance(raw, str):
+        return _PageMarkDecision.model_validate_json(raw)
+    return _PageMarkDecision.model_validate(raw)
+
+
+async def decide_page_marks(
+    *,
+    bank_id: str,
+    candidates: Mapping[str, list[tuple[str, str]]],
+    observation_texts: Mapping[str, str],
+    request_context: Any,
+    llm_config: Any,
+    config: Any,
+) -> frozenset[tuple[str, str]]:
+    """C8: one structured decision call for the whole job, keyed by observation block.
+
+    The server attributes each returned page id to the observation whose block it
+    came under, drops an id outside that observation's shortlist, and drops an id in
+    no block. One page offered by two observations yields two pairs.
+    """
+    blocks: list[str] = []
+    for obs_id, shortlist in candidates.items():
+        pages = [{"page_id": pid, "question": question} for pid, question in shortlist]
+        blocks.append(
+            json.dumps(
+                {
+                    "observation_id": str(obs_id),
+                    "observation_text": observation_texts.get(str(obs_id), ""),
+                    "candidates": pages,
+                },
+                ensure_ascii=False,
+            )
+        )
+    prompt = _PAGE_MARK_PROMPT.format(blocks="\n".join(blocks) or "[]")
+    call = await llm_config.call(
+        messages=[{"role": "user", "content": prompt}],
+        response_format=_PageMarkDecision,
+        temperature=getattr(config, "llm_temperature_consolidation", 0.0),
+        scope="consolidation_page_check",
+        strict_schema=getattr(config, "llm_strict_schema_consolidation", False),
+    )
+    decision = _page_decision_from_response(call.content)
+    selected: set[tuple[str, str]] = set()
+    for block in decision.blocks:
+        obs_id = str(block.observation_id)
+        offered = {pid for pid, _ in candidates.get(obs_id, [])}
+        for page_id in block.page_ids:
+            pid = str(page_id)
+            if pid in offered:
+                selected.add((obs_id, pid))
+    return frozenset(selected)
+
+
+async def _run_observation_page_check_steps(
+    *,
+    bank_id: str,
+    created: Mapping[str, list[str]],
+    config: Any,
+    request_context: Any,
+    memory_engine: "MemoryEngine",
+    llm_config: Any | None = None,
+    conn: Any | None = None,
+) -> PageCheckOutcome:
+    """C6's steps, unchanged by T8: one query, one search per subject, one call, one transaction.
+
+    The caller supplies the run's created set after the fold substitution. This
+    function raises on an ordinary failure at any step; the public
+    :func:`run_observation_page_check` is the fail-open boundary around it.
+    """
+    checked = {str(obs): list(sources) for obs, sources in created.items()}
+    if not checked:
+        return PageCheckOutcome(ran=False, selected=frozenset(), marks_written=0)
+    if llm_config is None:
+        llm_config = memory_engine._consolidation_llm_config.with_config(
+            config, bank_id=bank_id, operation="consolidation_page_check"
+        )
+    scope = getattr(config, "observation_marking_page_stale", "tag_wide")
+    async with AsyncExitStack() as stack:
+        active_conn = conn
+        if active_conn is None:
+            active_conn = await stack.enter_async_context(acquire_with_retry(memory_engine._backend))
+        # Oracle has no change records or mark writer. Skip here, before the
+        # first shortlist search spends an embedding (R16, model P8).
+        if not _page_check_backend_postgresql(active_conn):
+            return PageCheckOutcome(ran=False, selected=frozenset(), marks_written=0)
+        subjects = await get_memories().get_memories(
+            conn=active_conn, fq_table=fq_table, bank_id=bank_id, unit_ids=list(checked)
+        )
+        texts: dict[str, str] = {}
+        candidates: dict[str, list[tuple[str, str]]] = {}
+        for subject in subjects:
+            obs_id = str(subject.unit_id)
+            if obs_id not in checked:
+                continue
+            texts[obs_id] = subject.text
+            candidates[obs_id] = await page_shortlist(
+                memory_engine=memory_engine,
+                bank_id=bank_id,
+                observation_text=subject.text,
+                observation_tags=list(subject.tags or []),
+                scope=scope,
+                request_context=request_context,
+            )
+        selected = await decide_page_marks(
+            bank_id=bank_id,
+            candidates=candidates,
+            observation_texts=texts,
+            request_context=request_context,
+            llm_config=llm_config,
+            config=config,
+        )
+        async with active_conn.transaction():
+            written = await record_page_marks(conn=active_conn, bank_id=bank_id, marks=selected)
+    return PageCheckOutcome(ran=True, selected=selected, marks_written=written)
+
+
+async def run_observation_page_check(
+    *,
+    bank_id: str,
+    created: Mapping[str, list[str]],
+    config: Any,
+    request_context: Any,
+    memory_engine: "MemoryEngine",
+    llm_config: Any | None = None,
+    conn: Any | None = None,
+) -> PageCheckOutcome:
+    """C6's fail-open boundary around the one-per-job check (R14, machine 2 P3).
+
+    Every ordinary failure, at any of the five steps, is logged and returns a
+    no-op outcome so the consolidation job keeps its own already-committed
+    writes and writes no page marks. Cancellation and KeyboardInterrupt are not
+    check failures: they are re-raised untouched so a cancelled job still
+    cancels. A failed attempt never leaves a partial mark set: the steps write
+    the selected pairs in one short transaction, so an abort leaves none.
+    """
+    try:
+        return await _run_observation_page_check_steps(
+            bank_id=bank_id,
+            created=created,
+            config=config,
+            request_context=request_context,
+            memory_engine=memory_engine,
+            llm_config=llm_config,
+            conn=conn,
+        )
+    except (asyncio.CancelledError, KeyboardInterrupt):
+        raise
+    except Exception:
+        logger.warning(
+            "[CONSOLIDATION] bank=%s page check failed open; job writes are kept and no page marks were written",
+            bank_id,
+            exc_info=True,
+        )
+        return PageCheckOutcome(ran=False, selected=frozenset(), marks_written=0)
 
 
 _DEDUP_PROMPT = """You reconcile long-term memory observations. A NEW observation is about to be \
@@ -453,6 +690,7 @@ async def _apply_dedup_update_fold(
     outcome: _DedupOutcome,
     updated_id: str,
     updated_text: str,
+    fold_substitutions: dict[str, str] | None = None,
 ) -> bool:
     """Fold a just-rewritten observation into the twin the adjudicator matched it to.
 
@@ -488,6 +726,10 @@ async def _apply_dedup_update_fold(
         # keep the updated row as a distinct observation instead of deleting it unfolded.
         return False
     await _execute_delete_action(conn, bank_id, updated_id)
+    # R15: the created set is never pruned, so a created observation folded away here
+    # would be read after deletion at the job tail. Re-point it at the surviving twin.
+    if fold_substitutions is not None:
+        fold_substitutions[str(updated_id)] = str(outcome.best_id)
     logger.info(
         "[CONSOLIDATION] dedup-merged updated observation %s into %s (cosine>=%.2f)",
         updated_id[:8],
@@ -1885,6 +2127,7 @@ async def run_consolidation_job(
                 observation_scopes,
                 pending_refresh_tags,
                 caller_requested,
+                observation_changes,
             )
         finally:
             if trace_token is not None:
@@ -1906,9 +2149,13 @@ async def _run_consolidation_job(
     observation_scopes: list[list[str]] | None = None,
     pending_refresh_tags: list[str] | None = None,
     caller_requested: bool = False,
+    observation_changes: Any | None = None,
 ) -> dict[str, Any]:
     """Core consolidation flow. See ``run_consolidation_job`` for the public entrypoint."""
     perf = ConsolidationPerfLog(bank_id)
+    # R15: folded-created -> surviving-twin substitutions recorded at the fold site,
+    # applied once at the job tail to the run's created set.
+    fold_substitutions: dict[str, str] = {}
     max_memories_per_batch = config.consolidation_batch_size
     max_memories_per_round = config.consolidation_max_memories_per_round
     llm_batch_size = max(1, config.consolidation_llm_batch_size)
@@ -2153,6 +2400,7 @@ async def _run_consolidation_job(
                             config=config,
                             obs_tags_override=obs_tags,
                             mark_consolidated_ids=sub_ids if is_final_pass else None,
+                            fold_substitutions=fold_substitutions,
                         )
                         sub_deleted += pass_deleted
                         if pass_failed:
@@ -2196,6 +2444,7 @@ async def _run_consolidation_job(
                         perf=batch_perf,
                         config=config,
                         mark_consolidated_ids=sub_ids,
+                        fold_substitutions=fold_substitutions,
                     )
 
                 all_deleted += sub_deleted
@@ -2560,6 +2809,24 @@ async def _run_consolidation_job(
             f"their batch and were discarded; their facts are counted as skipped."
         )
 
+    # T6: the once-per-job page check. It runs here, after the last batch's writes
+    # committed and before the round-limit gate, so a round-limited run checks its
+    # own created set too. Its seam is wrapped by T8's fail-open/Oracle boundary.
+    checked = _checked_set_after_folds(
+        observation_changes.created if observation_changes is not None else {},
+        fold_substitutions,
+    )
+    page_outcome = await run_observation_page_check(
+        bank_id=bank_id,
+        created=checked,
+        config=config,
+        request_context=request_context,
+        memory_engine=memory_engine,
+        llm_config=llm_config,
+    )
+    stats["page_check_ran"] = page_outcome.ran
+    stats["page_marks_written"] = page_outcome.marks_written
+
     # Trigger mental-model refreshes once, when the chain has fully drained. On a
     # round-limited round we skip and carry the affected tags forward (above); the
     # final round flushes the accumulated union, so a model whose memories were
@@ -2732,6 +2999,7 @@ async def _process_memory_batch(
     config: Any = None,
     obs_tags_override: list[str] | None = None,
     mark_consolidated_ids: list[Any] | None = None,
+    fold_substitutions: dict[str, str] | None = None,
 ) -> tuple[list[dict[str, Any]], int, bool]:
     """
     Process a batch of memories in a single LLM call.
@@ -3211,6 +3479,7 @@ async def _process_memory_batch(
                                 prepared.dedup,
                                 prepared.update.observation_id,
                                 prepared.update.text,
+                                fold_substitutions,
                             )
 
                     for prepared_create in prepared_creates:
