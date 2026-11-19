@@ -204,7 +204,7 @@ async def record_change_event(
         event_type,
         before_text,
         after_text,
-        json.dumps(detail) if detail is not None else None,
+        json.dumps(detail, default=str) if detail is not None else None,
     )
 
 
@@ -246,7 +246,7 @@ async def record_page_marks(conn, *, bank_id: str, marks) -> int:
 
     by_event_id = {}
     for observation_id, page_id in marks:
-        detail = {"page_id": page_id}
+        detail = {"page_id": str(page_id)}
         event_id = _derived_event_id(
             bank_id=bank_id,
             subject_id=observation_id,
@@ -257,6 +257,11 @@ async def record_page_marks(conn, *, bank_id: str, marks) -> int:
         )
         by_event_id[event_id] = (str(observation_id), detail)
     pairs = sorted(by_event_id.items())
+    if not pairs:
+        # No mark to write: skip the xact-scoped lock and the pre-check SELECT
+        # entirely. Both would otherwise hold a bank lock and cost a round trip
+        # to insert nothing (round 30 F5).
+        return 0
 
     await conn.execute("SELECT pg_advisory_xact_lock(hashtext($1)::bigint)", bank_id)
     durable = await conn.fetch(

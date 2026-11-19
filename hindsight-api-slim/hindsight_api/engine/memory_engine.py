@@ -22041,7 +22041,8 @@ class MemoryEngine(MemoryEngineInterface):
             return False
         hit = await conn.fetchval(
             f"SELECT 1 FROM {fq_table('memory_change_events')} "
-            f"WHERE bank_id = $1 AND subject_id = ANY($2::uuid[]) AND seq > $3 LIMIT 1",
+            f"WHERE bank_id = $1 AND subject_id = ANY($2::uuid[]) AND seq > $3 "
+            f"AND event_type <> 'PAGE_MARK' LIMIT 1",
             bank_id,
             subject_uuids,
             baseline,
@@ -22448,13 +22449,17 @@ class MemoryEngine(MemoryEngineInterface):
         # C10 for the batch path: one page-mark statement for the whole batch,
         # above every staleness_check branch. A newer mark overrides the bank
         # watermark shortcut and the scope answer, in both modes.
+        # Page marks name the backing mental-model id. The caller's batch keys
+        # may be knowledge-page ids (the page tree), so ask by each provenance
+        # row's canonical id and map the verdict back to the caller's key. This
+        # keeps the batch answer identical to the single path's mm-id key.
         marked = await page_marks_read(
             conn,
             bank_id=bank_id,
-            pages=[(key, prov.baseline_seq) for key, prov in prov_map.items()],
+            pages=[(prov.page_id, prov.baseline_seq) for prov in prov_map.values()],
         )
-        for key, is_marked in marked.items():
-            if is_marked:
+        for key, prov in prov_map.items():
+            if marked.get(prov.page_id):
                 answers[key] = True
         return answers
 

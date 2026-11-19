@@ -82,3 +82,21 @@ def test_observation_marking_page_stale_absent_from_page_trigger_schema():
     """The value is bank-scoped, so no page trigger schema or MCP trigger input carries it."""
     assert FIELD_NAME not in MentalModelTrigger.model_fields
     assert FIELD_NAME not in MentalModelTriggerInput.model_fields
+
+
+@pytest.mark.asyncio
+async def test_observation_marking_page_stale_bank_config_rejects_out_of_literal_value():
+    """The bank-config write door must apply the same Literal membership as the env door.
+
+    Reducing ``Literal["bank_wide", "tag_wide"]`` to ``str`` for the runtime type
+    report used to let ``"bank-wide"`` through and persist it, while the env door
+    rejected the same string (round 30 F1). Both doors must share the rule.
+    """
+    backend = FakeBankConfigBackend()
+    resolver = ConfigResolver(backend=backend)
+
+    with pytest.raises(ValueError, match=FIELD_NAME):
+        await resolver.update_bank_config("bank", {FIELD_NAME: "bank-wide"})
+
+    # The rejected value must never reach the stored config.
+    assert FIELD_NAME not in backend.config

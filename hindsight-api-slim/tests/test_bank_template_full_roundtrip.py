@@ -136,7 +136,7 @@ _SAMPLE_VALUES: dict[str, Any] = {
     "consolidation_use_decision_model": False,
     "consolidation_max_memories_per_round": 42,
     "consolidation_llm_parallelism": 3,
-    "observation_marking_page_stale": "tag_wide",
+    "observation_marking_page_stale": "bank_wide",
     "recall_include_chunks": True,
     "recall_prefer_observations": True,
     "recall_decision_model_prune": True,
@@ -148,6 +148,15 @@ _SAMPLE_VALUES: dict[str, Any] = {
     # nested list, not just the top-level flag.
     "memory_defense": {"enabled": True, "rules": [{"on": "sensitive_data", "action": "redact"}]},
 }
+
+# These two samples predate the "differ from the default" rule and already equal
+# the server default (256 and True). They are explicitly grandfathered so the
+# guard below does not fail on history this change did not introduce. Every other
+# sample, including observation_marking_page_stale, must differ from its default.
+DEFAULT_EQUIVALENT_SAMPLES: frozenset[str] = frozenset({
+    "consolidation_source_facts_max_tokens_per_observation",
+    "recall_include_chunks",
+})
 
 
 @pytest_asyncio.fixture
@@ -202,7 +211,10 @@ def test_sample_values_cover_every_exportable_field():
     """A new BankTemplateConfig field must be given a value in _SAMPLE_VALUES.
 
     Guards the round-trip test below from quietly narrowing: without this, adding
-    a template field leaves it untested and nothing says so.
+    a template field leaves it untested and nothing says so. A sample that equals
+    the server default is also rejected (round 30 F2): a value that reverts to the
+    default then passes by luck. The two entries in DEFAULT_EQUIVALENT_SAMPLES are
+    explicitly grandfathered because they predate this rule.
     """
     declared = _current_template_fields()
     sampled = set(_SAMPLE_VALUES)
@@ -210,6 +222,17 @@ def test_sample_values_cover_every_exportable_field():
         f"_SAMPLE_VALUES is out of sync with BankTemplateConfig: "
         f"missing values for {sorted(declared - sampled)}, "
         f"stale entries for {sorted(sampled - declared)}"
+    )
+
+    defaults = HindsightConfig.from_env()
+    same_as_default = [
+        (field, value)
+        for field, value in _SAMPLE_VALUES.items()
+        if field not in DEFAULT_EQUIVALENT_SAMPLES and value == getattr(defaults, field)
+    ]
+    assert not same_as_default, (
+        "sample values must differ from the server default or a silent revert "
+        f"passes by luck; same as default: {same_as_default}"
     )
 
 
