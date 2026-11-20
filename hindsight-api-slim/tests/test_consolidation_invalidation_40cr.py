@@ -17,7 +17,6 @@ import asyncio
 import json
 import uuid
 from contextlib import ExitStack, asynccontextmanager
-from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -38,6 +37,7 @@ from hindsight_api.engine.consolidation.prompts import build_consolidation_syste
 from hindsight_api.engine.db_utils import acquire_with_retry
 from hindsight_api.engine.memory_engine import MemoryEngine
 from hindsight_api.engine.providers.mock_llm import MockLLM
+from hindsight_api.engine.response_models import LLMCallResult, TokenUsage
 
 
 def _response(*invalidations: dict) -> _FactBatchResponse:
@@ -612,9 +612,9 @@ class _ScriptedLLM:
         self.replies = list(replies)
         self.requests: list[dict[str, Any]] = []
 
-    async def call(self, **kwargs: Any) -> SimpleNamespace:
+    async def call(self, **kwargs: Any) -> LLMCallResult:
         self.requests.append(kwargs)
-        return SimpleNamespace(content=self.replies.pop(0))
+        return LLMCallResult(content=self.replies.pop(0), usage=TokenUsage())
 
 
 @pytest.mark.asyncio
