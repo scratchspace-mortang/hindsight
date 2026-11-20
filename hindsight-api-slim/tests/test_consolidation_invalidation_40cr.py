@@ -26,10 +26,10 @@ from hindsight_api.config import _get_raw_config
 from hindsight_api.engine import graph_maintenance
 from hindsight_api.engine.consolidation import consolidator as consolidator_module
 from hindsight_api.engine.consolidation.consolidator import (
+    _apply_invalidations_in_transaction,
     _BatchLLMResult,
     _FactBatchResponse,
     _Invalidation,
-    _apply_invalidations_in_transaction,
     filter_invalidations,
     run_consolidation_job,
 )
@@ -946,4 +946,162 @@ async def test_earlier_scope_requeue_survives_the_final_pass_stamp(memory: Memor
     assert rebuilt is not None, "the earlier scope's observation is rebuilt from the surviving co-source"
     assert rebuilt["text"] == "Alice lives in Potsdam", "the rebuild carries B's knowledge, not the old text"
     assert list(rebuilt["source_memory_ids"]) == [skipped_fact], "the rebuilt observation stands on B alone"
+    assert stamped is not None, "B is stamped only after the round that rebuilt it"
+
+
+# C7 across passes through the action loop: a requeue the pre-read cannot see
+
+
+@pytest.mark.asyncio
+@pytest.mark.memory_backend_incompatible
+async def test_update_widened_requeue_survives_the_final_pass_stamp(memory: MemoryEngine, request_context):
+    """C7 across passes: the response's own UPDATE, not the pre-read, names the survivor.
+
+    The first scope's response invalidates A and updates an observation that cited only B,
+    citing [A, B]. ``_apply_update_action`` extends the observation's sources with A before
+    the invalidation sweeps, so the sweep deletes a row the ``observations_for_sources`` read
+    taken before the action loop never returned, and requeues its surviving co-source B.
+    Reporting the requeue from that pre-read left B out of the final pass's exclusion set: the
+    final stamp cancelled the requeue and the deleted observation was never rebuilt from B.
+    """
+    bank_id = f"inval-update-requeue-{uuid.uuid4().hex[:8]}"
+    await memory.ensure_bank_profile(bank_id=bank_id, request_context=request_context)
+    archived_fact: uuid.UUID | None = None
+    surviving_fact: uuid.UUID | None = None
+    observation: uuid.UUID | None = None
+    requests: list[str] = []
+    replies = [
+        # Round 1, first scope: the model judges A wrong and lets B repeat the observation. Both
+        # entries cite the same observation, so the response's UPDATE cites [A, B] onto a row
+        # that cited only B; the invalidation sweep below deletes it and requeues B.
+        lambda: _FactBatchResponse(
+            facts=[
+                {
+                    "fact_id": str(archived_fact),
+                    "existing": [
+                        {
+                            "observation_id": str(observation),
+                            "observation_about": "Alice's home",
+                            "effect": "repeats",
+                        }
+                    ],
+                    "adds": "no",
+                },
+                {
+                    "fact_id": str(surviving_fact),
+                    "existing": [
+                        {
+                            "observation_id": str(observation),
+                            "observation_about": "Alice's home",
+                            "effect": "changes",
+                            "text": "Alice lives in Potsdam",
+                        }
+                    ],
+                    "adds": "no",
+                },
+            ],
+            invalidations=[{"fact_id": str(archived_fact), "reason": "contradicted by a later fact"}],
+        ),
+        # Round 1, final scope: A's repeated judgment skips at the liveness read and B is settled
+        # again, so the stamp this pass writes is what must not cancel the first scope's requeue.
+        lambda: _FactBatchResponse(
+            facts=[{"fact_id": str(surviving_fact), "kind": "momentary"}],
+            invalidations=[{"fact_id": str(archived_fact), "reason": "contradicted by a later fact"}],
+        ),
+        # Round 2, first scope: the requeued survivor rebuilds the observation there.
+        lambda: _FactBatchResponse(
+            facts=[
+                {
+                    "fact_id": str(surviving_fact),
+                    "kind": "durable",
+                    "about": "Alice's home",
+                    "adds": "yes",
+                    "new": ["Alice lives in Potsdam"],
+                }
+            ]
+        ),
+        # Round 2, final scope: B is settled again, so the rebuilt round stamps it.
+        lambda: _FactBatchResponse(facts=[{"fact_id": str(surviving_fact), "kind": "momentary"}]),
+    ]
+
+    def answer(messages, scope):
+        if scope == "consolidation":
+            requests.append("\n".join(str(message.get("content")) for message in messages))
+        return replies.pop(0)() if replies else _FactBatchResponse()
+
+    # The earlier scope's observation is built by the product from B alone, so the recall pool
+    # really contains it: a manually inserted row carries no embedding and consolidation's
+    # observation recall never returns it. One warm-up create per per_tag scope.
+    def warm_create() -> _FactBatchResponse:
+        return _FactBatchResponse(
+            facts=[
+                {
+                    "fact_id": str(surviving_fact),
+                    "kind": "durable",
+                    "about": "Alice's home",
+                    "adds": "yes",
+                    "new": ["Alice lives in Potsdam"],
+                }
+            ]
+        )
+
+    warm_replies = [warm_create, warm_create]
+
+    def warm_answer(messages, scope):
+        return warm_replies.pop(0)() if warm_replies else _FactBatchResponse()
+
+    try:
+        async with memory._pool.acquire() as conn:
+            # Same tags and the per_tag scope spec on both facts: one sub-batch, one LLM call per
+            # tag, and the user:alice pass is the first of the two.
+            surviving_fact = await _insert_fact(
+                conn, bank_id, "Alice lives in Potsdam", ["user:alice", "session:s1"], "per_tag"
+            )
+
+        warm = await _run_job(memory, bank_id, request_context, warm_answer)
+        assert warm["status"] == "completed"
+
+        async with memory._pool.acquire() as conn:
+            observation = await conn.fetchval(
+                "SELECT id FROM memory_units WHERE bank_id = $1 AND fact_type = 'observation' "
+                "AND tags @> $2::varchar[]",
+                bank_id,
+                ["user:alice"],
+            )
+            assert observation is not None, "the warm-up builds the earlier scope's observation"
+            # The observation cites B only: the pre-action read for A does not return it.
+            await conn.execute("UPDATE memory_units SET consolidated_at = NULL WHERE id = $1", surviving_fact)
+            archived_fact = await _insert_fact(
+                conn, bank_id, "Alice lives in Berlin", ["user:alice", "session:s1"], "per_tag"
+            )
+
+        # Only the measured run's calls count.
+        requests.clear()
+        result = await _run_job(memory, bank_id, request_context, answer)
+
+        async with memory._pool.acquire() as conn:
+            archived = await conn.fetchval("SELECT count(*) FROM invalidated_memory_units WHERE id = $1", archived_fact)
+            original_left = await conn.fetchval("SELECT count(*) FROM memory_units WHERE id = $1", observation)
+            rebuilt = await conn.fetchrow(
+                "SELECT text, source_memory_ids FROM memory_units "
+                "WHERE bank_id = $1 AND fact_type = 'observation' AND tags @> $2::varchar[]",
+                bank_id,
+                ["user:alice"],
+            )
+            stamped = await conn.fetchval("SELECT consolidated_at FROM memory_units WHERE id = $1", surviving_fact)
+    finally:
+        await memory.delete_bank(bank_id, request_context=request_context)
+
+    assert result["status"] == "completed"
+    assert archived == 1, "the judged fact is archived"
+    assert original_left == 0, "the update-widened observation is swept by the invalidation"
+    assert len(requests) == 4, (
+        "the sweep's requeue of B is fetched again after the final pass; reading the requeue "
+        "from before the action loop left B out of the exclusion set, the stamp cancelled it, "
+        "and the deleted observation never came back"
+    )
+    assert "Alice lives in Potsdam" in requests[2], "the next round consolidates the survivor at the earlier scope"
+    assert rebuilt is not None, "the earlier scope's observation is rebuilt from the surviving co-source"
+    assert rebuilt["text"] == "Alice lives in Potsdam", "the rebuild carries B's knowledge, not the old text"
+    assert list(rebuilt["source_memory_ids"]) == [surviving_fact], "the rebuilt observation stands on B alone"
     assert stamped is not None, "B is stamped only after the round that rebuilt it"

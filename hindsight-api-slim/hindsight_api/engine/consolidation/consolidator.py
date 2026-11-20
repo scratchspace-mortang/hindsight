@@ -3594,7 +3594,9 @@ async def _process_memory_batch(
                     # function widens an observation id to its source memories, so the
                     # co-sources land in the same sorted statement. One plain SELECT — it
                     # takes no row lock — so the write set is still locked before any other
-                    # lock.
+                    # lock. This read only names rows to lock: the requeue set reported back
+                    # is read again after the action loop, which can widen an observation's
+                    # sources with an invalidated fact (see the invalidation step below).
                     if invalidation_entries:
                         affected_observations = await get_memories().observations_for_sources(
                             conn=conn,
@@ -3604,15 +3606,6 @@ async def _process_memory_batch(
                             unit_ids=[fact_id for fact_id, _ in invalidation_entries],
                         )
                         touched += [observation.unit_id for observation in affected_observations]
-                        # The sweeps below delete every one of these observations and reset
-                        # ``consolidated_at`` on their surviving sources. Report those survivors: a
-                        # caller that stamps on a later pass must leave them out of that stamp, or
-                        # the stamp lands after this sweep and cancels the requeue (C7 across passes).
-                        requeued_co_sources = {
-                            str(source_id)
-                            for observation in affected_observations
-                            for source_id in observation.source_memory_ids
-                        } - {fact_id for fact_id, _ in invalidation_entries}
                     await get_memories().lock_consolidation_write_set(
                         conn=conn,
                         fq_table=fq_table,
@@ -3757,6 +3750,33 @@ async def _process_memory_batch(
                     # commit, so the archive moves and the dependent-observation sweeps commit
                     # or roll back with the rest of the response (R9, DST5, DST8).
                     if invalidation_entries:
+                        invalidated_ids = {fact_id for fact_id, _ in invalidation_entries}
+                        # Re-read what the sweeps will actually meet, now that the response's
+                        # deletes, updates and merges have run: an update or a fold extends an
+                        # observation's sources with an invalidated fact after the pre-read that
+                        # named the write set, and a batch DELETE removes an observation that
+                        # pre-read named. Reporting the pre-read's set would miss the survivor the
+                        # sweep requeues (a later pass stamps it and the deleted observation is
+                        # never rebuilt) and over-report the co-sources of a row this transaction
+                        # already deleted. One plain SELECT, in this transaction, immediately
+                        # before the sweeps.
+                        swept_observations = await get_memories().observations_for_sources(
+                            conn=conn,
+                            ops=memory_engine._backend.ops,
+                            fq_table=fq_table,
+                            bank_id=bank_id,
+                            unit_ids=sorted(invalidated_ids),
+                        )
+                        # The sweeps below delete every one of these observations and reset
+                        # ``consolidated_at`` on their surviving sources. Report those survivors: a
+                        # caller that stamps on a later pass must leave them out of that stamp, or
+                        # the stamp lands after this sweep and cancels the requeue (C7 across passes).
+                        # The invalidated facts themselves are archived, not survivors.
+                        requeued_co_sources = {
+                            str(source_id)
+                            for observation in swept_observations
+                            for source_id in observation.source_memory_ids
+                        } - invalidated_ids
                         try:
                             await _apply_invalidations_in_transaction(
                                 conn,
@@ -3773,7 +3793,6 @@ async def _process_memory_batch(
                                 exc_info=True,
                             )
                             raise
-                        invalidated_ids = {fact_id for fact_id, _ in invalidation_entries}
 
                     await write_batch.commit()
         except BaseException as exc:
