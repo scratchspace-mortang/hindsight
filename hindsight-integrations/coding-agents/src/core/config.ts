@@ -160,15 +160,18 @@ export interface RawConfig {
    *    "auto-refresh"           — refresh after every consolidation that produced new material
    *    "manual"                 — never refresh on its own; the tools and control plane still can
    *  Auto-refresh is both the most current and the most expensive: one LLM synthesis per page per
-   *  consolidation, which adds up fast across auto-surveyed repos (#3506) — hence the hourly
-   *  staggered schedule as the default. Existing pages keep the trigger they were created with —
-   *  this changes what NEW pages get. */
+   *  consolidation, which adds up fast across auto-surveyed repos (#3506) — hence the six-hourly
+   *  staggered schedule as the default. Existing pages are re-synced to the configured trigger on
+   *  the next seed run: drift detection sees the difference and patches it, so this reaches existing
+   *  pages as well as new ones. */
   pageTriggerType?: "auto-refresh" | "cron" | "manual";
   /** Schedule for `pageTriggerType: "cron"` — UTC, standard 5-field cron, e.g. "0 3 * * *".
-   *  Defaults to DEFAULT_PAGE_TRIGGER_CRON ("H */6 * * *": every six hours, on each page's own minute).
-   *  A field written `H` ("0 3 * * *" -> "H H * * *") is replaced per page by a value hashed from
-   *  bank + page name, so pages spread across the period instead of all firing on the one minute
-   *  this shared setting names. See `expandCronHash` in core/missions.ts. */
+   *  Defaults to DEFAULT_PAGE_TRIGGER_CRON in core/missions.ts: every six hours, on each page's
+   *  own hashed minute (a hashed minute field followed by a six-hour step; the constant spells it
+   *  out). A field written `H` ("0 3 * * *" -> "H H * * *") is replaced per page by a value hashed
+   *  from bank + page name, so pages spread across the minutes of each six-hour window instead of
+   *  all firing on the one minute this shared setting names. See `expandCronHash` in
+   *  core/missions.ts. */
   pageTriggerCron?: string;
   /** Per-page configuration for the seeded pages, keyed by page name (case-insensitive):
    *    "Component map": false                                   — don't seed this page at all
@@ -361,7 +364,7 @@ export interface Config {
  * The page-refresh trigger a raw config asks for: the schedule kind, and the expression it fires on.
  *
  * `"cron"` is the default and needs no `pageTriggerCron`: an omitted expression takes
- * DEFAULT_PAGE_TRIGGER_CRON, so the common config — none of these fields at all — is an hourly
+ * DEFAULT_PAGE_TRIGGER_CRON, so the common config — none of these fields at all — is a six-hourly
  * staggered refresh. A user who wants pages to stop refreshing on their own writes "manual".
  *
  * A malformed `H` is refused here and not one step later: `expandCronHash` leaves an expression it

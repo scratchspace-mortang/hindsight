@@ -1141,6 +1141,16 @@ class _Invalidation(BaseModel):
     fact_id: str
     reason: str = ""
 
+    @field_validator("reason", mode="before")
+    @classmethod
+    def null_reason_is_empty(cls, v: Any) -> Any:
+        # C4/D6/R8: the emission is the judgment and `reason` is optional audit metadata the
+        # writer stores as `str | None`. An explicit JSON null must not lose the entry:
+        # `_validate_items` would refuse it and drop a valid model judgment over metadata.
+        if v is None:
+            return ""
+        return (sanitize_llm_output(v) or "") if isinstance(v, str) else v
+
 
 def filter_invalidations(
     entries: list[tuple[str, str]],
@@ -1200,11 +1210,15 @@ async def _apply_invalidations_in_transaction(
     seam cannot drive them from inside a live event loop. The skip rule and the
     archive-then-sweep ordering are the same as the seam's; both callables raise
     out to the batch transaction, which rolls every write back together.
+
+    The archive move goes through the memories store, which owns those rows: calling
+    the Postgres writer directly makes this module name `memory_units` outside the
+    store, and the schema resolver refuses that (#4969).
     """
-    from ..memories.pg.writes import invalidate_memory
+    store = get_memories()
 
     for fact_id, reason in entries:
-        moved = await invalidate_memory(
+        moved = await store.invalidate_memory(
             conn=conn, fq_table=fq_table, bank_id=bank_id, unit_id=fact_id, reason=reason
         )
         if moved is False:
@@ -3532,13 +3546,16 @@ async def _process_memory_batch(
                     await assert_job_bank_alive(conn, bank_id)
                     changed_ids = await _sources_changed_since_read(conn, bank_id, memories)
                     if changed_ids:
-                        # Drop the whole response, stamps included: the facts stay pending and the
-                        # job's next fetch re-reads them as they are now (#4831).
+                        # Drop the whole response, stamps and invalidations included: the facts stay
+                        # pending and the job's next fetch re-reads them as they are now (#4831). An
+                        # invalidation is a judgment on the pre-edit text, so applying it would
+                        # archive a fact a curation edit deliberately kept live.
                         logger.info(
                             f"[CONSOLIDATION] bank={bank_id} discarding batch of {len(memories)}: "
                             f"{len(changed_ids)} source fact(s) edited since read, e.g. {changed_ids[0]}"
                         )
                         prepared_deletes, prepared_updates, prepared_creates, stamp_ids = [], [], [], []
+                        invalidation_entries = []
 
                     # Each action below reads its sources (liveness, entities) and, for an update,
                     # the observation it rewrites — one read at a time. Naming them all first lets
@@ -3665,11 +3682,14 @@ async def _process_memory_batch(
                             failed=False,
                         )
                     await write_batch.commit()
-        except BaseException:
+        except BaseException as exc:
             await write_batch.abort()
-            if invalidation_failed:
+            if invalidation_failed and isinstance(exc, Exception):
                 # The warning was logged at the step; the whole batch rolled back, so
-                # report it like any other failed batch and let the job carry on.
+                # report it like any other failed batch and let the job carry on. Only an
+                # ordinary Exception qualifies: a cancellation or interrupt that arrives
+                # while the transaction unwinds is not a batch failure, and turning it into
+                # a return value swallows it (asyncio never re-delivers a swallowed cancel).
                 return ([{"action": "failed"} for _ in memories], 0, True)
             raise
 

@@ -429,14 +429,17 @@ export interface PageTriggerConfig {
  * happened to share the one minute the docs suggested. Moving the hour moves the pile.
  *
  * `H` is Jenkins' syntax for exactly this problem, borrowed rather than invented because it is
- * already recognisable, and it composes with the rest of the expression instead of replacing it:
- *
- *   "H H * * *"      once a day, at this page's own minute and hour
- *   "H */6 * * *"   once every six hours, at this page's own minute
- *   "H 3 * * *"      daily at 03:MM — spread within the hour the operator chose
- *   "H H(0-5) * * *" daily, spread across the night only
- *   "0 3 * * *"      unchanged: no `H`, no hashing, exactly what it says
- *
+ * already recognisable, and it composes with the rest of the expression instead of replacing it.
+ * The examples are line comments rather than a block: the shipped six-hour expression carries a
+ * `/6` step right after a `*`, and that pair would end a block comment early.
+ */
+//   "H H * * *"      once a day, at this page's own minute and hour
+//   "H */6 * * *"   once every six hours, at this page's own minute
+//   "H 3 * * *"      daily at 03:MM — spread within the hour the operator chose
+//   "H H(0-5) * * *" daily, spread across the night only
+//   "0 3 * * *"      unchanged: no `H`, no hashing, exactly what it says
+//
+/**
  * The alternative — one enum member per period (`daily-staggered`, then `hourly-staggered`, then
  * whatever is asked for next) — spells the schedule in the type name, so every new period is a new
  * config value, a new branch, and a new row of docs. Spreading is a property of the SCHEDULE, so it
@@ -589,8 +592,8 @@ export interface CurrentPageTrigger {
  * Has an existing page's refresh policy drifted from what this config asks for?
  *
  * Compared against the page's OWN resolved trigger (`pageTriggerFor`), not the shared one: under a
- * hashed cron every page has a different expression, and comparing the unresolved `H */6 * * *`
- * would report drift on every page on every session.
+ * hashed cron every page has a different expression, and comparing the unresolved default (minute
+ * still written as `H`) would report drift on every page on every session.
  *
  * Only the fields this plugin actually states are compared. Everything else on the trigger —
  * `mode`, sibling exclusion, `min_refresh_interval_seconds` — is the server's or the operator's,

@@ -219,8 +219,11 @@ describe("pageTriggerDrifted", () => {
     ).toBe(true);
   });
 
-  it("reports a page still on the old weekly cron as drifted", () => {
-    // R5/A6: an existing weekly page must reconcile to the six-hour default on the next run.
+  it("reports a page still on the old weekly cron as drifted (predicate only)", () => {
+    // R5/A6: the drift PREDICATE says an existing weekly page is out of policy, and the seed run's
+    // PATCH is gated on exactly this predicate. This test pins the predicate only; the seam that
+    // applies it is pinned in core/hindsight.pages.test.ts ("re-syncs a page still on the old
+    // weekly cron, trigger only").
     const desired = settled("Component map");
     expect(desired.refresh_cron).toContain("*/6");
     expect(
@@ -230,14 +233,15 @@ describe("pageTriggerDrifted", () => {
 
   it("does not compare fields the server or operator owns", () => {
     // C3: drift is only tags_match, refresh_cron and refresh_after_consolidation. A current
-    // trigger differing in staleness_check, mode, siblings or min_refresh_interval_seconds is not
-    // drift, and must not cause a re-sync that restates those fields.
+    // trigger differing in staleness_check, mode, exclude_mental_models or
+    // min_refresh_interval_seconds is not drift, and must not cause a re-sync that restates
+    // those fields.
     const desired = settled("Component map");
     const current = {
       ...desired,
       staleness_check: "graph",
       mode: "graph",
-      exclude_siblings: true,
+      exclude_mental_models: true,
       min_refresh_interval_seconds: 3600,
     };
     expect(pageTriggerDrifted(current, desired)).toBe(false);
@@ -268,13 +272,14 @@ describe("pageTriggerPatch", () => {
   });
 
   it("states only the plugin-owned fields on a cadence re-sync", () => {
-    // C3: a reconciliation patch must not restate the server's staleness_check, mode, sibling
-    // exclusion or min_refresh_interval_seconds; the field-by-field server merge preserves them.
+    // C3: a reconciliation patch must not restate the server's staleness_check, mode,
+    // exclude_mental_models or min_refresh_interval_seconds; the field-by-field server merge
+    // preserves them.
     const patch = pageTriggerPatch(buildPageTrigger());
     expect(Object.keys(patch).sort()).toEqual(["fact_types", "refresh_cron", "tags_match"]);
     expect(patch).not.toHaveProperty("staleness_check");
     expect(patch).not.toHaveProperty("mode");
-    expect(patch).not.toHaveProperty("exclude_siblings");
+    expect(patch).not.toHaveProperty("exclude_mental_models");
     expect(patch).not.toHaveProperty("min_refresh_interval_seconds");
   });
 });
@@ -320,7 +325,17 @@ describe("page trigger config resolution", () => {
   });
 
   it("accepts a well-formed hashed cron", () => {
-    for (const good of ["H */6 * * *", "H H * * *", "H * * * *", "H 3 * * *", "H H(0-5) * * *"]) {
+    // The step cases must not be the default constant itself: `resolvePageTrigger` falls back to
+    // DEFAULT_PAGE_TRIGGER_CRON when parsing rejects, so `"H */6 * * *"` alone would read the same
+    // whether the validator accepted it or fell back. `"H */12 * * *"` can only match on acceptance.
+    for (const good of [
+      "H */12 * * *",
+      "H */6 * * *",
+      "H H * * *",
+      "H * * * *",
+      "H 3 * * *",
+      "H H(0-5) * * *",
+    ]) {
       const cfg = resolveConfig({ pageTriggerType: "cron", pageTriggerCron: good });
       expect(cfg.pageTriggerType).toBe("cron");
       expect(cfg.pageTriggerCron).toBe(good);

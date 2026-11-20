@@ -555,9 +555,10 @@ describe("HindsightClient.seedPages", () => {
         /^knowledge:(feature-work|decision|convention|component|concept)$/
       );
       expect(post.body.max_tokens).toBe(PAGE_MAX_TOKENS);
-      // The default schedule, with the page's own hashed minute already resolved.
+      // The default schedule, with the page's own hashed minute already resolved: the six-hour
+      // step is part of the default, so the resolved hour field stays `*/6`.
       expect(post.body.trigger.refresh_after_consolidation).toBeUndefined();
-      expect(post.body.trigger.refresh_cron).toMatch(/^(?:[0-9]|[1-5][0-9]) \* \* \* \*$/);
+      expect(post.body.trigger.refresh_cron).toMatch(/^(?:[0-9]|[1-5][0-9]) \*\/6 \* \* \*$/);
       // NOT the server's `all_strict` default for a tagged model: that excludes untagged
       // memories, and every observation this plugin's banks consolidate is untagged.
       expect(post.body.trigger.tags_match).toBe("all");
@@ -694,7 +695,7 @@ describe("HindsightClient.seedPages", () => {
     for (const [i, patch] of patches.entries()) {
       // ONLY the trigger: sending `source_query` would schedule a full rebuild of every page on
       // a bank whose question never changed. The cron is the page's OWN resolved one — patching
-      // the literal `H * * * *` would reach the server as a cron it cannot parse.
+      // the literal `H */6 * * *` would reach the server as a cron it cannot parse.
       expect(patch.body).toEqual({
         trigger: pageTriggerFor(buildPageTrigger(), "repo-a", PAGES[i].name),
       });
@@ -703,7 +704,7 @@ describe("HindsightClient.seedPages", () => {
 
   /**
    * The whole point of re-syncing the refresh policy and not just `tags_match`: a bank seeded
-   * before the default became the hourly staggered schedule sits on `refresh_after_consolidation`
+   * before the default became the six-hourly staggered schedule sits on `refresh_after_consolidation`
    * — one LLM synthesis per page per consolidation — and nothing about its source query changed,
    * so without this it would keep paying that forever (#3506).
    */
@@ -733,6 +734,44 @@ describe("HindsightClient.seedPages", () => {
       // Stating the cron is what clears the auto-refresh server-side; the two are exclusive.
       expect(patch.body.trigger.refresh_after_consolidation).toBeUndefined();
       expect(patch.body.source_query).toBeUndefined();
+    }
+  });
+
+  /**
+   * R5/A6 through the seeding path: a page created under the old weekly cron is out of policy
+   * against the six-hourly default, so the same re-sync runs and the PATCH carries the page's own
+   * resolved six-hour cron. The drift predicate alone is pinned in missions.test.ts; this is the
+   * seam that actually rewrites the page.
+   */
+  it("re-syncs a page still on the old weekly cron, trigger only", async () => {
+    const calls: any[] = [];
+    stubFetchRouted(calls, [
+      {
+        match: (m, u) => m === "GET" && u.endsWith("/pages/tree"),
+        json: {
+          roots: PAGES.map((p, i) => ({
+            id: `kp-${i}`,
+            kind: "page",
+            name: p.name,
+            description: p.source_query,
+            trigger: { tags_match: "all", refresh_cron: "21 3 * * 0" },
+          })),
+        },
+      },
+    ]);
+    const c = new HindsightClient({ apiUrl: "http://x", bank: "repo-a" });
+    await c.seedPages();
+
+    const patches = calls.filter((k) => k.method === "PATCH");
+    expect(patches).toHaveLength(PAGES.length);
+    for (const [i, patch] of patches.entries()) {
+      // Only the trigger travels, and it is the page's own resolved six-hourly cron: never the
+      // stored weekly expression, and never the shared `H */6 * * *` literal.
+      expect(patch.body).toEqual({
+        trigger: pageTriggerFor(buildPageTrigger(), "repo-a", PAGES[i].name),
+      });
+      expect(patch.body.trigger.refresh_cron).toContain("*/6");
+      expect(patch.body.trigger.refresh_cron).not.toBe("21 3 * * 0");
     }
   });
 
