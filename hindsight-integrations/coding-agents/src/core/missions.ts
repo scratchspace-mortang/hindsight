@@ -401,15 +401,15 @@ const PAGE_TAGS_MATCH = "all" as const;
 export const PAGE_FACT_TYPES = ["world", "experience", "observation"];
 
 /**
- * The default schedule: once an hour, each page on its own hashed minute (see `H` below).
+ * The default schedule: once every six hours, each page on its own hashed minute (see `H` below).
  *
- * Hourly rather than daily because a page a coding agent reads at the start of a session
- * is worth little if it lags a day behind the repo; hourly rather than per-consolidation because a
- * refresh costs one LLM synthesis per page, and a repo under active work consolidates far more
- * often than once an hour. The server skips a tick that has nothing new to fold in, so an idle
- * repo pays nothing for the schedule.
+ * Six-hourly rather than daily because a page a coding agent reads at the start of a session
+ * is worth little if it lags a day behind the repo; six-hourly rather than per-consolidation
+ * because a refresh costs one LLM synthesis per page, and a repo under active work consolidates
+ * far more often than every six hours. The server skips a tick that has nothing new to fold in,
+ * so an idle repo pays nothing for the schedule.
  */
-export const DEFAULT_PAGE_TRIGGER_CRON = "H * * * *";
+export const DEFAULT_PAGE_TRIGGER_CRON = "H */6 * * *";
 
 /** The config fields that shape the trigger (a subset of Config — see core/config.ts). */
 export interface PageTriggerConfig {
@@ -432,7 +432,7 @@ export interface PageTriggerConfig {
  * already recognisable, and it composes with the rest of the expression instead of replacing it:
  *
  *   "H H * * *"      once a day, at this page's own minute and hour
- *   "H * * * *"      once an hour, at this page's own minute
+ *   "H */6 * * *"   once every six hours, at this page's own minute
  *   "H 3 * * *"      daily at 03:MM — spread within the hour the operator chose
  *   "H H(0-5) * * *" daily, spread across the night only
  *   "0 3 * * *"      unchanged: no `H`, no hashing, exactly what it says
@@ -542,8 +542,9 @@ export function pageTriggerFor(trigger: PageTrigger, bank: string, page: string)
  * How this project's pages keep themselves current.
  *
  * WHEN is the only part of this that is a preference. The default is `cron` on
- * `DEFAULT_PAGE_TRIGGER_CRON` — hourly, each page on its own hashed minute: current within the
- * hour, and bounded, since the server skips a tick when nothing changed. `auto-refresh`, which
+ * `DEFAULT_PAGE_TRIGGER_CRON` — every six hours, each page on its own hashed minute: current
+ * within six hours, and bounded, since the server skips a tick when nothing changed.
+ * `auto-refresh`, which
  * every page used to ship with, rebuilds whenever consolidation produced new material — the most
  * current setting and by far the most expensive, since a busy repo consolidates constantly and
  * each pass is an LLM synthesis per page (#3506). `manual` refreshes only when something asks. A
@@ -588,7 +589,7 @@ export interface CurrentPageTrigger {
  * Has an existing page's refresh policy drifted from what this config asks for?
  *
  * Compared against the page's OWN resolved trigger (`pageTriggerFor`), not the shared one: under a
- * hashed cron every page has a different expression, and comparing the unresolved `H * * * *`
+ * hashed cron every page has a different expression, and comparing the unresolved `H */6 * * *`
  * would report drift on every page on every session.
  *
  * Only the fields this plugin actually states are compared. Everything else on the trigger —

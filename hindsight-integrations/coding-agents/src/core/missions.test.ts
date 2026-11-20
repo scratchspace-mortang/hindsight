@@ -26,7 +26,7 @@ import {
  * the fact.
  */
 describe("buildPageTrigger", () => {
-  it("defaults to the hourly staggered schedule", () => {
+  it("defaults to the six-hourly staggered schedule", () => {
     expect(buildPageTrigger()).toMatchObject({
       fact_types: PAGE_FACT_TYPES,
       refresh_cron: DEFAULT_PAGE_TRIGGER_CRON,
@@ -108,6 +108,18 @@ describe("hashed cron fields", () => {
     expect(cron("H * * * *", "repo-a", "Component map")).toMatch(
       /^(?:[0-9]|[1-5][0-9]) \* \* \* \*$/
     );
+  });
+
+  it("replaces only hashed fields and passes the six-hour hour through", () => {
+    // The shipped default. Only the minute is hashed; `*/6` is ordinary cron and must survive
+    // expansion unchanged, so all pages keep their own minute but stay on the six-hour cadence.
+    const expanded = expandCronHash("H */6 * * *", "repo-a\u0000Component map").split(" ");
+    expect(expanded).toHaveLength(5);
+    expect(expanded[0]).toMatch(/^(?:[0-9]|[1-5][0-9])$/);
+    expect(expanded[1]).toBe("*/6");
+    expect(expanded.slice(2)).toEqual(["*", "*", "*"]);
+    // A page with no H at all is returned byte-for-byte, including a literal */6 expression.
+    expect(expandCronHash("23 */6 * * *", "repo-a")).toBe("23 */6 * * *");
   });
 
   it("keeps the fields the operator wrote and hashes only the H", () => {
@@ -199,12 +211,36 @@ describe("pageTriggerDrifted", () => {
     expect(pageTriggerDrifted({ tags_match: "all", refresh_cron: "0 3 * * *" }, desired)).toBe(
       true
     );
-    // Compared against the page's OWN resolved cron, never the shared `H * * * *` — otherwise
+    // Compared against the page's OWN resolved cron, never the shared `H */6 * * *` — otherwise
     // every page would look drifted on every session.
     expect(desired.refresh_cron).not.toBe(DEFAULT_PAGE_TRIGGER_CRON);
     expect(
       pageTriggerDrifted({ ...desired, refresh_cron: DEFAULT_PAGE_TRIGGER_CRON }, desired)
     ).toBe(true);
+  });
+
+  it("reports a page still on the old weekly cron as drifted", () => {
+    // R5/A6: an existing weekly page must reconcile to the six-hour default on the next run.
+    const desired = settled("Component map");
+    expect(desired.refresh_cron).toContain("*/6");
+    expect(
+      pageTriggerDrifted({ tags_match: "all", refresh_cron: "21 3 * * 0" }, desired)
+    ).toBe(true);
+  });
+
+  it("does not compare fields the server or operator owns", () => {
+    // C3: drift is only tags_match, refresh_cron and refresh_after_consolidation. A current
+    // trigger differing in staleness_check, mode, siblings or min_refresh_interval_seconds is not
+    // drift, and must not cause a re-sync that restates those fields.
+    const desired = settled("Component map");
+    const current = {
+      ...desired,
+      staleness_check: "graph",
+      mode: "graph",
+      exclude_siblings: true,
+      min_refresh_interval_seconds: 3600,
+    };
+    expect(pageTriggerDrifted(current, desired)).toBe(false);
   });
 
   it("still sees the tags_match drift it was originally written for", () => {
@@ -230,21 +266,32 @@ describe("pageTriggerPatch", () => {
     expect(patch.refresh_after_consolidation).toBe(false);
     expect(patch.refresh_cron).toBeNull();
   });
+
+  it("states only the plugin-owned fields on a cadence re-sync", () => {
+    // C3: a reconciliation patch must not restate the server's staleness_check, mode, sibling
+    // exclusion or min_refresh_interval_seconds; the field-by-field server merge preserves them.
+    const patch = pageTriggerPatch(buildPageTrigger());
+    expect(Object.keys(patch).sort()).toEqual(["fact_types", "refresh_cron", "tags_match"]);
+    expect(patch).not.toHaveProperty("staleness_check");
+    expect(patch).not.toHaveProperty("mode");
+    expect(patch).not.toHaveProperty("exclude_siblings");
+    expect(patch).not.toHaveProperty("min_refresh_interval_seconds");
+  });
 });
 
 describe("page trigger config resolution", () => {
-  // The default: hourly, each page on its own hashed minute. Auto-refresh — one LLM synthesis per
-  // page per consolidation — is now opt-in.
-  it("schedules an unconfigured repo's pages hourly and staggered", () => {
+  // The default: every six hours, each page on its own hashed minute. Auto-refresh — one LLM
+  // synthesis per page per consolidation — is now opt-in.
+  it("schedules an unconfigured repo's pages six-hourly and staggered", () => {
     expect(resolveConfig({}).pageTriggerType).toBe("cron");
     expect(resolveConfig({}).pageTriggerCron).toBe(DEFAULT_PAGE_TRIGGER_CRON);
-    expect(DEFAULT_PAGE_TRIGGER_CRON).toBe("H * * * *");
+    expect(DEFAULT_PAGE_TRIGGER_CRON).toBe("H */6 * * *");
     const trigger = buildPageTrigger(resolveConfig({}));
     expect(trigger.refresh_cron).toBe(DEFAULT_PAGE_TRIGGER_CRON);
     expect(trigger.refresh_after_consolidation).toBeUndefined();
     // And the `H` is resolved per page before it is sent — see "hashed cron fields" above.
     expect(pageTriggerFor(trigger, "repo-a", "Component map").refresh_cron).toMatch(
-      /^(?:[0-9]|[1-5][0-9]) \* \* \* \*$/
+      /^(?:[0-9]|[1-5][0-9]) \*\/6 \* \* \*$/
     );
   });
 
@@ -273,7 +320,7 @@ describe("page trigger config resolution", () => {
   });
 
   it("accepts a well-formed hashed cron", () => {
-    for (const good of ["H H * * *", "H * * * *", "H 3 * * *", "H H(0-5) * * *"]) {
+    for (const good of ["H */6 * * *", "H H * * *", "H * * * *", "H 3 * * *", "H H(0-5) * * *"]) {
       const cfg = resolveConfig({ pageTriggerType: "cron", pageTriggerCron: good });
       expect(cfg.pageTriggerType).toBe("cron");
       expect(cfg.pageTriggerCron).toBe(good);

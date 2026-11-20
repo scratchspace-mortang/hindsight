@@ -165,7 +165,7 @@ export interface RawConfig {
    *  this changes what NEW pages get. */
   pageTriggerType?: "auto-refresh" | "cron" | "manual";
   /** Schedule for `pageTriggerType: "cron"` — UTC, standard 5-field cron, e.g. "0 3 * * *".
-   *  Defaults to DEFAULT_PAGE_TRIGGER_CRON ("H * * * *": hourly, on each page's own minute).
+   *  Defaults to DEFAULT_PAGE_TRIGGER_CRON ("H */6 * * *": every six hours, on each page's own minute).
    *  A field written `H` ("0 3 * * *" -> "H H * * *") is replaced per page by a value hashed from
    *  bank + page name, so pages spread across the period instead of all firing on the one minute
    *  this shared setting names. See `expandCronHash` in core/missions.ts. */
