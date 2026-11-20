@@ -184,8 +184,48 @@ async def test_store_ranked_search_also_overfetches_before_the_stale_drop(monkey
 
     result = await tool_search_mental_models(engine, conn, "40cr-store", "current state", [0.1, 0.2])
 
-    assert asked_limits and asked_limits[0] > 5, "the store is asked for more than the requested top-k"
+    assert asked_limits == [15], "the store is asked for the same 15-candidate set the SQL path ranks (5 x 3)"
     assert [page["id"] for page in result["mental_models"]] == [fresh_id], (
         "the stale store-ranked top-k is dropped and the fresh page below it is still served"
     )
     assert result["count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_store_ranked_search_truncates_fresh_survivors_to_max_results(monkeypatch) -> None:
+    """C5 truncation: more fresh pages survive the stale drop than ``max_results``.
+
+    Nothing is dropped here -- all six candidates are fresh graph pages -- so only the
+    slice back to ``max_results`` can hold the result to five. The other C5 scenarios end
+    with one survivor, which a stale drop alone produces: a regression that returned the
+    whole fetched candidate set (up to 3x the requested pages) would still satisfy their
+    count of one. This case fails by the length assertion when that slice is gone.
+    """
+    fresh_ids = [f"store-fresh-{index}" for index in range(6)]
+    rows = [_row(page_id, page_id, {"staleness_check": "graph"}) for page_id in fresh_ids]
+    ranked = [SimpleNamespace(page_id=page_id, score=1.0 - index / 10) for index, page_id in enumerate(fresh_ids)]
+    asked_limits: list[int] = []
+
+    async def rank(bank_id, *, embedding, limit, **kwargs):
+        asked_limits.append(limit)
+        return ranked[:limit]
+
+    store = SimpleNamespace(store_owned_for=lambda bank_id: True, search_pages_semantic=rank)
+    monkeypatch.setattr("hindsight_api.engine.memories.get_memories", lambda: store)
+
+    async def hydrate(query, bank_id, ids):
+        return [row for row in rows if row["id"] in ids]
+
+    conn = MagicMock()
+    conn.fetch = AsyncMock(side_effect=hydrate)
+    engine = AsyncMock()
+    engine.compute_mental_models_are_stale = AsyncMock(return_value={page_id: False for page_id in fresh_ids})
+
+    result = await tool_search_mental_models(engine, conn, "40cr-truncate", "current state", [0.1, 0.2], max_results=5)
+
+    assert len(result["mental_models"]) == 5, "reflect gets the requested five, not the fetched candidate set"
+    assert result["count"] == 5, "the result count is the truncated set, not the fetched one"
+    assert [page["id"] for page in result["mental_models"]] == fresh_ids[:5], (
+        "the truncation keeps the top-ranked five in rank order"
+    )
+    assert asked_limits == [15], "the store is asked for the 15-candidate set the SQL path ranks"
