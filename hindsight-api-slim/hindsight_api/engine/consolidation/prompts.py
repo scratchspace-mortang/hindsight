@@ -133,7 +133,9 @@ For each fact:
 
 A lasting fact must end up somewhere: an existing observation it repeats, changes or ends, or `new`. Otherwise it is lost.
 
-`deletes` (rare): only when two EXISTING observations say exactly the same thing — delete one by its `observation_id`, with `merged_into` set to the other: `"deletes": [{{"observation_id": "O7", "merged_into": "O2"}}]`. Never delete because something changed or ended."""
+`deletes` (rare): only when two EXISTING observations say exactly the same thing — delete one by its `observation_id`, with `merged_into` set to the other: `"deletes": [{{"observation_id": "O7", "merged_into": "O2"}}]`. Never delete because something changed or ended.
+
+`invalidations` (rare): when a fact in THIS batch shows that an earlier raw fact in the same batch is outdated, name that earlier fact here — one entry per outdated fact: `{{"fact_id": "F3", "reason": "one sentence saying why this fact is outdated"}}`. Emit an entry only when you judge that fact outdated; when no fact is outdated, leave `"invalidations": []`. Only raw facts from this batch can be invalidated — never an observation, never a mental model, never a fact outside the batch. The `reason` is your own explanation recorded with the archive; it is not used to decide which fact is current."""
 
 # Facts are handed over in processing order, which is not the order things happened: imports and
 # backfills deliver old conversations late. Small models read the batch as the latest news and let
@@ -149,7 +151,7 @@ The new facts are listed oldest first. When two new facts disagree about the sam
 
 _OUTPUT_SECTION = """## OUTPUT FORMAT
 
-Return one JSON object: `{{"facts": [...one entry per new fact, in order...], "deletes": []}}`.
+Return one JSON object: `{{"facts": [...one entry per new fact, in order...], "deletes": [], "invalidations": []}}`.
 
 ### Example
 
@@ -193,7 +195,8 @@ Output:
     "adds": "no", "new": [], "same_as_fact": null}},
   {{"fact_id": "F6", "about": "ledger-sink", "kind": "lasting", "existing": [], "adds": "no", "new": [], "same_as_fact": "F1"}}
 ],
-"deletes": []}}
+"deletes": [],
+"invalidations": []}}
 
 Why: O1, F1's closest, is about billing-sink, not ledger-sink: unrelated. The rotation's membership (O2) and Cleo's Mondays (O3) end; O3 was not among the closest but mentions Cleo, so it is found by scanning. Cleo's city (O6), a closest one, is another facet: unrelated. The dog count (O4) is not touched by a named dog: unrelated. Svelte was stated after React, so F5 changes O5 with no text: Svelte stays the favorite and F5 is added as its earlier state. F6 has no closest observations and repeats F1.
 

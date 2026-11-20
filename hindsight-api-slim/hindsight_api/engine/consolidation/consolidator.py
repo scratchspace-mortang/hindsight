@@ -1135,6 +1135,83 @@ class _SkipAction(BaseModel):
     fact_id: str
 
 
+class _Invalidation(BaseModel):
+    """A raw source fact the consolidation model judged outdated, with its own reason."""
+
+    fact_id: str
+    reason: str = ""
+
+
+def filter_invalidations(
+    entries: list[tuple[str, str]],
+    *,
+    batch_fact_ids: set[str],
+    curatable_ids: set[str],
+) -> list[tuple[str, str]]:
+    """Keep only in-batch, curatable ``(fact_id, reason)`` pairs, first reason winning.
+
+    Ineligible ids are refused silently and traced; an observation or mental-model
+    id is never in ``curatable_ids`` (A5, DST3). Each surviving reason is the one
+    the model emitted (C4).
+    """
+    kept: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    for fact_id, reason in entries:
+        if fact_id in seen:
+            continue
+        if fact_id not in batch_fact_ids or fact_id not in curatable_ids:
+            logger.debug(
+                "[CONSOLIDATION] refused invalidation of %s: not in batch or not curatable", fact_id
+            )
+            continue
+        seen.add(fact_id)
+        kept.append((fact_id, reason))
+    return kept
+
+
+def apply_invalidation_actions(
+    entries: list[tuple[str, str]],
+    *,
+    invalidate: Callable[[str, str], bool],
+    sweep: Callable[[str], None],
+) -> None:
+    """Archive each fact with its own reason and sweep its dependents in one step.
+
+    An absent live row (writer returns False) is a skip, not a rollback. Exceptions
+    from either callable propagate into the caller's transaction, which rolls the
+    whole batch back; the caller logs and continues with the next batch.
+    """
+    for fact_id, reason in entries:
+        if invalidate(fact_id, reason) is False:
+            continue
+        sweep(fact_id)
+
+
+async def _apply_invalidations_in_transaction(
+    conn: Any,
+    *,
+    bank_id: str,
+    entries: list[tuple[str, str]],
+    memory_engine: Any,
+) -> None:
+    """Async twin of :func:`apply_invalidation_actions` for the batch transaction.
+
+    The C7 writer and the M5 sweep are awaited SQL calls, so the pinned synchronous
+    seam cannot drive them from inside a live event loop. The skip rule and the
+    archive-then-sweep ordering are the same as the seam's; both callables raise
+    out to the batch transaction, which rolls every write back together.
+    """
+    from ..memories.pg.writes import invalidate_memory
+
+    for fact_id, reason in entries:
+        moved = await invalidate_memory(
+            conn=conn, fq_table=fq_table, bank_id=bank_id, unit_id=fact_id, reason=reason
+        )
+        if moved is False:
+            continue
+        await memory_engine.sweep_invalidation_dependents(conn, bank_id, [fact_id])
+
+
 class _ConsolidationBatchResponse(BaseModel):
     """The writes an answer turns into (:meth:`_FactBatchResponse.to_actions`)."""
 
@@ -1142,6 +1219,8 @@ class _ConsolidationBatchResponse(BaseModel):
     updates: list[_UpdateAction] = []
     deletes: list[_DeleteAction] = []
     skips: list[_SkipAction] = []
+    #: Model-judged source facts to invalidate, carried beside creates/updates/deletes.
+    invalidations: list[_Invalidation] = []
 
 
 def _validate_items(v: Any, handler: Any) -> Any:
@@ -1217,10 +1296,18 @@ class _FactBatchResponse(BaseModel):
 
     facts: list[_FactDecision] = []
     deletes: list[_DeleteAction] = []
+    #: Raw source facts the model judged outdated, each with its own reason (C4).
+    invalidations: list[_Invalidation] = []
 
     @field_validator("facts", mode="wrap")
     @classmethod
     def _drop_invalid(cls, v: Any, handler: Any) -> Any:
+        return _validate_items(v, handler)
+
+    @field_validator("invalidations", mode="wrap")
+    @classmethod
+    def _drop_invalid_invalidations(cls, v: Any, handler: Any) -> Any:
+        # C4: one bad entry must not reject the response's creates and updates.
         return _validate_items(v, handler)
 
     def with_real_ids(self, real_id: dict[str, str]) -> "_FactBatchResponse":
@@ -1237,6 +1324,8 @@ class _FactBatchResponse(BaseModel):
         for d in self.deletes:
             d.observation_id = real(d.observation_id)
             d.merged_into = real(d.merged_into) if d.merged_into else d.merged_into
+        for inv in self.invalidations:
+            inv.fact_id = real(inv.fact_id)
         return self
 
     def to_actions(
@@ -1340,7 +1429,11 @@ class _FactBatchResponse(BaseModel):
             if not own and f.same_as_fact and (twin := creates.get(f.same_as_fact)) is not None:
                 cite(twin, f.fact_id)
         return _ConsolidationBatchResponse(
-            creates=all_creates, updates=list(updates.values()), deletes=self.deletes, skips=skips
+            creates=all_creates,
+            updates=list(updates.values()),
+            deletes=self.deletes,
+            skips=skips,
+            invalidations=list(self.invalidations),
         )
 
 
@@ -1392,6 +1485,8 @@ class _BatchLLMResult:
     deletes: list[_DeleteAction] = field(default_factory=list)
     #: Facts the model chose not to record as a create or update.
     skips: list[_SkipAction] = field(default_factory=list)
+    #: Raw source facts the model judged outdated, carried from the response.
+    invalidations: list[_Invalidation] = field(default_factory=list)
     obs_count: int = 0
     prompt_chars: int = 0
     failed: bool = False
@@ -3136,6 +3231,20 @@ async def _process_memory_batch(
         perf.record_llm_call(llm_result.obs_count, llm_result.prompt_chars)
         perf.record_llm_batch_failures(llm_result.failed_attempts)
     honored_skips = _settle_skips(llm_result)
+    # C5: only source facts in this batch and of a curatable type are eligible. The
+    # model emitted the whole judgment; the service applies it without deciding
+    # which conflicting fact is current (R8, R11). Each reason travels with its id.
+    invalidation_entries = (
+        filter_invalidations(
+            [(inv.fact_id, inv.reason) for inv in llm_result.invalidations],
+            batch_fact_ids={str(m["id"]) for m in memories},
+            curatable_ids={
+                str(m["id"]) for m in memories if m.get("fact_type") in ("world", "experience")
+            },
+        )
+        if not llm_result.failed
+        else []
+    )
     # A failed call writes nothing — the caller bisects and re-runs these facts, triage included —
     # so the triage verdicts must not land on their own, unstamped, ahead of that re-run (#6239).
     if not llm_result.failed:
@@ -3391,13 +3500,14 @@ async def _process_memory_batch(
     # bisects and retries them, and a stamp would exclude them from pending consolidation
     # for good. With neither writes nor stamps there is nothing to open a transaction for.
     stamp_ids = list(mark_consolidated_ids or []) if not llm_result.failed else []
-    if prepared_deletes or prepared_updates or prepared_creates or stamp_ids:
+    if prepared_deletes or prepared_updates or prepared_creates or stamp_ids or invalidation_entries:
         # One store batch for everything this response decided. The SQL transaction already makes
         # these writes all-or-nothing for a store that keeps its rows in SQL; a store whose every
         # write is its own atomic call needs the batch to say the same thing — otherwise it applies
         # them one by one, and a failure part-way leaves the deletes applied and the creates not.
         # Committed INSIDE the transaction, so a batch that fails to apply rolls the SQL side back
         # with it.
+        invalidation_failed = False
         write_batch = await get_memories().begin_write_batch(bank_id=bank_id)
         try:
             async with acquire_with_retry(pool) as conn:
@@ -3519,6 +3629,27 @@ async def _process_memory_batch(
                     for merged in merged_away:
                         await _fold_deleted_evidence(conn, memory_engine, bank_id, merged.gone, merged.target_id)
 
+                    # C6: invalidate model-judged facts inside this open transaction, before
+                    # commit, so the archive moves and the dependent-observation sweeps commit
+                    # or roll back with the rest of the response (R9, DST5, DST8).
+                    if invalidation_entries:
+                        try:
+                            await _apply_invalidations_in_transaction(
+                                conn,
+                                bank_id=bank_id,
+                                entries=invalidation_entries,
+                                memory_engine=memory_engine,
+                            )
+                        except Exception:
+                            invalidation_failed = True
+                            logger.warning(
+                                "[CONSOLIDATION] bank=%s invalidation step failed; "
+                                "batch rolled back; job continues with the next batch",
+                                bank_id,
+                                exc_info=True,
+                            )
+                            raise
+
                     # The facts this response consumed are marked consolidated in the SAME transaction
                     # as the observations that now carry them. Stamping them separately is what let a
                     # half-applied batch orphan its sources forever: the pending-consolidation predicate
@@ -3536,6 +3667,10 @@ async def _process_memory_batch(
                     await write_batch.commit()
         except BaseException:
             await write_batch.abort()
+            if invalidation_failed:
+                # The warning was logged at the step; the whole batch rolled back, so
+                # report it like any other failed batch and let the job carry on.
+                return ([{"action": "failed"} for _ in memories], 0, True)
             raise
 
     # Build per-memory result dicts for the stats tracker in the outer loop
@@ -4409,6 +4544,7 @@ async def _consolidate_batch_with_llm(
                 updates=updates,
                 deletes=response.deletes,
                 skips=response.skips,
+                invalidations=response.invalidations,
                 obs_count=len(union_observations),
                 prompt_chars=len(system_prompt) + len(user_content),
                 failed_attempts=failed_attempts,

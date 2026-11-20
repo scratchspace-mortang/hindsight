@@ -17861,6 +17861,15 @@ class MemoryEngine(MemoryEngineInterface):
 
         return await delete_stale_observations_for_memories(conn, bank_id, fact_ids, ops=self._backend.ops)
 
+    async def sweep_invalidation_dependents(self, conn, bank_id: str, fact_ids: list[str]) -> None:
+        """C6 seam: the ``update_memory_unit`` state=invalidated dependent-observation sweep.
+
+        Observation-only: it drops observations whose source facts are gone and never
+        archives or rewrites a memory row, so the C7 writer stays the only archive path.
+        The consolidation batch drives it inside the open transaction after each move.
+        """
+        await self._delete_stale_observations_for_memories(conn, bank_id, fact_ids)
+
     # =========================================================================
     # MENTAL MODELS CRUD
     # =========================================================================
