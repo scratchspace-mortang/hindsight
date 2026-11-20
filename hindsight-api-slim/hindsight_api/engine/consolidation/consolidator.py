@@ -1136,7 +1136,7 @@ class _SkipAction(BaseModel):
 
 
 class _Invalidation(BaseModel):
-    """A raw source fact the consolidation model judged outdated, with its own reason."""
+    """A raw source fact the consolidation model judged wrong, with its own reason."""
 
     fact_id: str
     reason: str = ""
@@ -1206,23 +1206,48 @@ async def _apply_invalidations_in_transaction(
 ) -> None:
     """Async twin of :func:`apply_invalidation_actions` for the batch transaction.
 
-    The C7 writer and the M5 sweep are awaited SQL calls, so the pinned synchronous
-    seam cannot drive them from inside a live event loop. The skip rule and the
-    archive-then-sweep ordering are the same as the seam's; both callables raise
-    out to the batch transaction, which rolls every write back together.
+    Mirrors the canonical invalidate sequence: per entry it sweeps the fact's dependent
+    observations, captures the relink victims and entity prune candidates, moves the row
+    through the store seam, then sweeps again so an observation inserted by a racing writer
+    is caught too. The captures must run before the move — once the row, its links and its
+    entity postings are gone, the joins that find them return nothing.
+
+    An absent live row is a skip with no sweep and no enqueue, settled by the store's
+    share-locked liveness read before the first sweep. The C7 writer and the M5 sweep are
+    awaited SQL calls, so the pinned synchronous seam cannot drive them from inside a live
+    event loop; both callables raise out to the batch transaction, which rolls every write
+    back together.
 
     The archive move goes through the memories store, which owns those rows: calling
     the Postgres writer directly makes this module name `memory_units` outside the
     store, and the schema resolver refuses that (#4969).
     """
+    from ..graph_maintenance import enqueue_entity_prune_candidates, enqueue_relink_victims
+
     store = get_memories()
 
     for fact_id, reason in entries:
+        # Settle the row's liveness first, with the store's share-locked read: the captures
+        # below must run before the move, and an absent row is the seam's skip — no sweep and
+        # no enqueue for it (the writer cannot be asked first without sweeping too late).
+        live = await store.lock_live_memory_ids(
+            conn=conn, fq_table=fq_table, bank_id=bank_id, unit_ids=[uuid.UUID(fact_id)]
+        )
+        if fact_id not in live:
+            continue
+        # The canonical invalidate sequence (MemoryEngine's "Invalidate: move live → archive"),
+        # in its order: sweep before the row moves, in the sweep's lock order (see
+        # delete_document), then capture the relink victims and entity prune candidates before
+        # the row (and its links and postings) go.
+        await memory_engine.sweep_invalidation_dependents(conn, bank_id, [fact_id])
+        await enqueue_relink_victims(conn, bank_id, [fact_id])
+        await enqueue_entity_prune_candidates(conn, bank_id, [fact_id])
         moved = await store.invalidate_memory(
             conn=conn, fq_table=fq_table, bank_id=bank_id, unit_id=fact_id, reason=reason
         )
         if moved is False:
             continue
+        # Sweep after the move, so a racing observation insert is caught too.
         await memory_engine.sweep_invalidation_dependents(conn, bank_id, [fact_id])
 
 
@@ -1310,7 +1335,7 @@ class _FactBatchResponse(BaseModel):
 
     facts: list[_FactDecision] = []
     deletes: list[_DeleteAction] = []
-    #: Raw source facts the model judged outdated, each with its own reason (C4).
+    #: Raw source facts the model judged wrong, each with its own reason (C4).
     invalidations: list[_Invalidation] = []
 
     @field_validator("facts", mode="wrap")
@@ -1499,7 +1524,7 @@ class _BatchLLMResult:
     deletes: list[_DeleteAction] = field(default_factory=list)
     #: Facts the model chose not to record as a create or update.
     skips: list[_SkipAction] = field(default_factory=list)
-    #: Raw source facts the model judged outdated, carried from the response.
+    #: Raw source facts the model judged wrong, carried from the response.
     invalidations: list[_Invalidation] = field(default_factory=list)
     obs_count: int = 0
     prompt_chars: int = 0
@@ -3532,6 +3557,25 @@ async def _process_memory_batch(
                     touched += [d.merged_into for d in prepared_deletes]
                     touched += [u.update.observation_id for u in prepared_updates]
                     touched += [p.dedup.best_id for p in [*prepared_updates, *prepared_creates] if p.dedup]
+                    # The invalidation step archives these facts and sweeps the observations
+                    # built on them, then requeues their surviving co-sources — rows this
+                    # transaction would otherwise meet for the first time inside the sweep,
+                    # after it already holds the fact (#4251). Name them here: the lock
+                    # function widens an observation id to its source memories, so the
+                    # co-sources land in the same sorted statement. One plain SELECT — it
+                    # takes no row lock — so the write set is still locked before any other
+                    # lock.
+                    if invalidation_entries:
+                        touched += [
+                            observation.unit_id
+                            for observation in await get_memories().observations_for_sources(
+                                conn=conn,
+                                ops=memory_engine._backend.ops,
+                                fq_table=fq_table,
+                                bank_id=bank_id,
+                                unit_ids=[fact_id for fact_id, _ in invalidation_entries],
+                            )
+                        ]
                     await get_memories().lock_consolidation_write_set(
                         conn=conn,
                         fq_table=fq_table,

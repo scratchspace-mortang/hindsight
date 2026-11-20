@@ -153,6 +153,90 @@ async def _race(db_url: str) -> AsyncIterator[_Race]:
         await setup.close()
 
 
+@asynccontextmanager
+async def _invalidation_race(db_url: str) -> AsyncIterator[_Race]:
+    """Two facts and one observation standing on both — C6's sweep reaching #4251's cycle.
+
+    `pending` is consolidation's batch and `other` is the fact a second transaction sweeps;
+    `obs` is the observation built on both, so a sweep of either fact deletes it and requeues
+    the other as a surviving co-source. The ids are ordered obs < pending < other because the
+    sweep locks in id order: it takes the observation before the fact it requeues, which is
+    the order the cycle needs.
+    """
+    setup = await asyncpg.connect(db_url)
+    bank = f"deadlock-inval-{uuid.uuid4().hex}"
+    base = int(uuid.uuid4().int) & ~0xFF
+    obs, pending, other = (uuid.UUID(int=base + offset) for offset in (1, 2, 3))
+    dim = await setup.fetchval(
+        "SELECT atttypmod FROM pg_attribute WHERE attrelid = 'memory_units'::regclass AND attname = 'embedding'"
+    )
+    embedding = "[" + ",".join(["0.1"] * dim) + "]"
+    await setup.execute("INSERT INTO banks(bank_id) VALUES($1)", bank)
+    await setup.execute("INSERT INTO documents(id, bank_id) VALUES($1, $2)", _DOC, bank)
+    for idx, (chunk, unit) in enumerate([("pending", pending), ("other", other)]):
+        await setup.execute(
+            "INSERT INTO chunks(chunk_id, document_id, bank_id, chunk_index, chunk_text) VALUES($1,$2,$3,$4,'t')",
+            f"{bank}-{chunk}",
+            _DOC,
+            bank,
+            idx,
+        )
+        await setup.execute(
+            "INSERT INTO memory_units(id, bank_id, document_id, chunk_id, text, fact_type, embedding) "
+            "VALUES($1,$2,$3,$4,'fact','world',$5::vector)",
+            unit,
+            bank,
+            _DOC,
+            f"{bank}-{chunk}",
+            embedding,
+        )
+    # `other` is already consolidated; `pending` is the batch's pending fact.
+    await setup.execute("UPDATE memory_units SET consolidated_at = NOW() WHERE id = $1", other)
+    await setup.execute(
+        "INSERT INTO memory_units(id, bank_id, text, fact_type, source_memory_ids) VALUES($1,$2,'obs','observation',$3)",
+        obs,
+        bank,
+        [pending, other],
+    )
+    row = await setup.fetchrow("SELECT updated_at FROM memory_units WHERE id=$1", pending)
+    watch = await asyncpg.create_pool(db_url, min_size=1, max_size=3)
+    backends: list[PostgreSQLBackend] = []
+    try:
+        pids = []
+        for _ in range(2):
+            b = PostgreSQLBackend()
+            await b.initialize(db_url, min_size=1, max_size=1, command_timeout=15)
+            backends.append(b)
+            async with b.acquire() as c:
+                pids.append(await c.fetchval("SELECT pg_backend_pid()"))
+        yield _Race(
+            setup=setup,
+            watch=watch,
+            bank=bank,
+            consolidation_pool=backends[0],
+            writer_pool=backends[1],
+            consolidation_pid=pids[0],
+            writer_pid=pids[1],
+            other=other,
+            pending=pending,
+            obs=obs,
+            embedding=embedding,
+            # ``filter_invalidations`` admits only a curatable (raw) batch fact: the response
+            # must be able to invalidate this one.
+            memories=[
+                {"id": str(pending), "text": "fact", "fact_type": "world", "tags": [], "updated_at": row["updated_at"]}
+            ],
+        )
+    finally:
+        for b in backends:
+            await b.shutdown()
+        await watch.close()
+        for table in ("invalidated_memory_units", "memory_units", "chunks", "documents"):
+            await setup.execute(f"DELETE FROM {table} WHERE bank_id=$1", bank)
+        await setup.execute("DELETE FROM banks WHERE bank_id=$1", bank)
+        await setup.close()
+
+
 def _llm_result(race: _Race, action: str) -> "C._BatchLLMResult":
     return {
         "delete": C._BatchLLMResult(deletes=[C._DeleteAction(observation_id=str(race.obs))]),
@@ -160,6 +244,9 @@ def _llm_result(race: _Race, action: str) -> "C._BatchLLMResult":
             updates=[C._UpdateAction(observation_id=str(race.obs), text="obs v2", source_fact_ids=[str(race.pending)])]
         ),
         "stamp": C._BatchLLMResult(),
+        "invalidate": C._BatchLLMResult(
+            invalidations=[C._Invalidation(fact_id=str(race.pending), reason="superseded by a later fact")]
+        ),
     }[action]
 
 
@@ -169,9 +256,12 @@ async def _consolidate(
     *,
     pause: Callable[[], Awaitable[None]] | None = None,
     before_locks: Callable[[], Awaitable[None]] | None = None,
+    engine: MemoryEngine | None = None,
 ) -> None:
     """``_process_memory_batch`` for `pending`, its LLM answering ``action``. Inside the write
-    transaction, ``before_locks`` runs before it takes any lock, ``pause`` after its first reads."""
+    transaction, ``before_locks`` runs before it takes any lock, ``pause`` after its first reads.
+    ``engine`` is the memory engine the batch drives; the default is just enough for the write
+    transaction, and an invalidation needs the real sweep seam."""
     real_changed_since = C._sources_changed_since_read
     store = get_memories()
     real_lock_set = store.lock_consolidation_write_set
@@ -216,7 +306,8 @@ async def _consolidate(
     ):
         await C._process_memory_batch(
             pool=race.consolidation_pool,
-            memory_engine=types.SimpleNamespace(
+            memory_engine=engine
+            or types.SimpleNamespace(
                 _backend=race.consolidation_pool, embeddings=object(), _validator_with_hook=lambda name: None
             ),
             llm_config=object(),
@@ -326,3 +417,68 @@ async def test_delete_document_and_consolidation_do_not_deadlock(pg0_db_url, req
         results = await asyncio.gather(task_d, task_c, return_exceptions=True)
         assert [r for r in results if isinstance(r, BaseException)] == []
         assert results[0] == {"document_deleted": 1, "memory_units_deleted": 3}
+
+
+async def test_invalidation_sweep_does_not_deadlock_with_a_concurrent_sweep(pg0_db_url):
+    """#4251's cycle, reached through the C6 invalidation step's dependent sweep.
+
+    Consolidation holds `pending` from its batch pre-lock; the invalidation step archives it and
+    sweeps `obs`, the observation built on `pending` and `other`. A second transaction sweeping
+    `other` holds `obs` and waits for `pending` as the surviving co-source. Without the fix
+    consolidation blocks on `obs` while already holding `pending`: a cycle the #4251 statement
+    order cannot break, because the pre-lock never named the dependent observation. With the fix
+    the pre-lock names `obs` first, so consolidation waits before it holds anything, the second
+    sweep completes, and both transactions finish.
+    """
+    async with _invalidation_race(pg0_db_url) as race:
+        holding = asyncio.Event()
+        paused = asyncio.Event()
+
+        async def hold_after_prelock() -> None:
+            # Unfixed: the pre-lock named only the fact, so this pause is reached while the
+            # other sweep is still open; it now blocks on that fact, and the two transactions
+            # hold each other's row. Fixed: the pre-lock already waited on the observation, so
+            # this pause is only reached once the other transaction has committed — and then
+            # there is nothing left to wait for.
+            paused.set()
+            await _until(race.watch, race.writer_pid, _WAITING, 2)
+
+        async def concurrent_sweep() -> None:
+            engine = _engine(race.writer_pool)
+            async with race.writer_pool.acquire() as conn, conn.transaction():
+                # Take the observation first: it is where the sweep's id order starts, and
+                # holding it makes the cycle form on state rather than on statement scheduling.
+                await conn.execute("SELECT id FROM memory_units WHERE id = $1 FOR NO KEY UPDATE", race.obs)
+                holding.set()
+                # Wait for consolidation to take its side: past its pre-lock (unfixed) or
+                # blocked on that pre-lock (fixed). Bounded — the side that wins completes
+                # unaided, so a timeout here only means the race already resolved.
+                try:
+                    async with asyncio.timeout(10):
+                        while not (
+                            paused.is_set() or await race.watch.fetchval(_WAITING, race.consolidation_pid)
+                        ):
+                            await asyncio.sleep(0.01)
+                except TimeoutError:
+                    pass
+                await engine.sweep_invalidation_dependents(conn, race.bank, [str(race.other)])
+
+        engine = _engine(race.consolidation_pool)
+        engine.embeddings = object()
+        task_sweep = asyncio.create_task(concurrent_sweep())
+        await holding.wait()
+        task_c = asyncio.create_task(_consolidate(race, "invalidate", pause=hold_after_prelock, engine=engine))
+        results = await asyncio.gather(task_c, task_sweep, return_exceptions=True)
+        assert [r for r in results if isinstance(r, BaseException)] == []
+
+        async with race.writer_pool.acquire() as conn:
+            live = await conn.fetchval("SELECT count(*) FROM memory_units WHERE id = $1", race.pending)
+            archived = await conn.fetchval("SELECT count(*) FROM invalidated_memory_units WHERE id = $1", race.pending)
+            swept = await conn.fetchval("SELECT count(*) FROM memory_units WHERE id = $1", race.obs)
+        # This tuple proves the end state, not which actor produced it: the consolidation sweep
+        # and the concurrent writer's own dependent sweep both delete the observation, so
+        # `swept == 0` alone cannot attribute the delete. The F7 guard is the exception-free
+        # gather above: without the pre-lock read it raises DeadlockDetectedError.
+        assert (live, archived, swept) == (0, 1, 0), (
+            "the judged fact reached the archive and its dependent observation was swept"
+        )

@@ -22,14 +22,17 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from hindsight_api.config import _get_raw_config
+from hindsight_api.engine import graph_maintenance
 from hindsight_api.engine.consolidation import consolidator as consolidator_module
 from hindsight_api.engine.consolidation.consolidator import (
     _BatchLLMResult,
     _FactBatchResponse,
     _Invalidation,
+    _apply_invalidations_in_transaction,
     filter_invalidations,
     run_consolidation_job,
 )
+from hindsight_api.engine.consolidation.prompts import build_consolidation_system_prompt
 from hindsight_api.engine.db_utils import acquire_with_retry
 from hindsight_api.engine.memory_engine import MemoryEngine
 from hindsight_api.engine.providers.mock_llm import MockLLM
@@ -73,6 +76,21 @@ def test_only_in_batch_curatable_facts_are_eligible() -> None:
 
     assert eligible == [("f-outdated", "superseded")], "only the emitted in-batch curatable fact is eligible"
     assert "f-current" not in [fact_id for fact_id, _ in eligible], "a batch fact the model did not emit stays untouched"
+
+
+def test_in_batch_fact_outside_the_curatable_set_is_refused() -> None:
+    """P4: in-batch is not enough — the eligibility helper refuses a non-curatable type.
+
+    ``batch_fact_ids`` and ``curatable_ids`` were always the same set in the pinned cases,
+    so the second half of :func:`filter_invalidations` never decided anything. A summary row
+    of this batch is in the batch and must still be refused while a raw sibling lands.
+    """
+    eligible = filter_invalidations(
+        [("f-summary", "a derived summary, not a raw fact"), ("f-outdated", "superseded")],
+        batch_fact_ids={"f-summary", "f-outdated"},
+        curatable_ids={"f-outdated"},
+    )
+    assert eligible == [("f-outdated", "superseded")], "only the curatable in-batch fact is eligible"
 
 
 def test_duplicate_invalidations_keep_the_first_reason() -> None:
@@ -129,6 +147,31 @@ def test_apply_handles_each_eligible_entry(eligible: list[tuple[str, str]]) -> N
     assert calls == [fact_id for fact_id, _ in eligible]
 
 
+def test_absent_row_is_a_skip_with_no_sweep() -> None:
+    """P6: the documented skip rule — a writer that found no live row cancels the sweep.
+
+    An absent row is not a rollback: the batch moves on to the next entry. Nothing was
+    archived, so nothing derived from it may be swept.
+    """
+    from hindsight_api.engine.consolidation.consolidator import apply_invalidation_actions
+
+    written: list[str] = []
+    swept: list[str] = []
+
+    def writer(fact_id: str, reason: str) -> bool:
+        written.append(fact_id)
+        return fact_id == "f-live"
+
+    apply_invalidation_actions(
+        [("f-absent", "superseded"), ("f-live", "superseded")],
+        invalidate=writer,
+        sweep=swept.append,
+    )
+
+    assert written == ["f-absent", "f-live"], "the writer is still asked about every entry"
+    assert swept == ["f-live"], "the absent row is skipped, the live sibling still sweeps"
+
+
 def test_explicit_null_reason_keeps_the_model_judgment() -> None:
     """C4/D6/R8: emission is the judgment; ``reason`` is optional audit metadata.
 
@@ -146,6 +189,127 @@ def test_explicit_null_reason_keeps_the_model_judgment() -> None:
         curatable_ids={"f-1"},
     )
     assert eligible == [("f-1", "")], "the judgment survives and stays eligible"
+
+
+def _paragraph(system: str, opening: str) -> str:
+    """The one paragraph a prompt section starts with, up to its blank line."""
+    start = system.index(opening)
+    return system[start : system.index("\n\n", start)]
+
+
+def test_invalidation_rule_separates_wrong_facts_from_superseded_ones() -> None:
+    """P3: the invalidation rule must not sentence history the TIME rule keeps.
+
+    The rule used to say only that an earlier in-batch fact is "outdated" when a later fact
+    shows it, which is exactly the in-batch case ``_TIME_RULE`` keeps as the earlier state:
+    two rules, one input, no stated priority. They now agree — invalidation is for a fact
+    this batch shows to be WRONG, while a state merely superseded by a later one stays
+    recorded as history.
+    """
+    system = build_consolidation_system_prompt()
+    rule = _paragraph(system, "`invalidations` (rare)")
+    time_rule = system[system.index("## TIME") : system.index("## WHAT AN OBSERVATION IS")]
+
+    assert "outdated" not in rule, "the superseded-history reading is what the TIME rule contradicts"
+    assert "wrong" in rule.lower(), "the rule must name the WRONG-fact criterion"
+    assert "superseded" in rule, "and must say that merely being superseded is not wrong"
+    assert "invalidat" in time_rule.lower(), "the TIME rule must point at the invalidation rule"
+
+
+# ── the production path's canonical sequence, without a database ───────────────
+
+
+class _FakeStore:
+    """The store reads/writes the invalidation step makes, recorded in call order."""
+
+    def __init__(self, order: list[str], *, live: bool, moved: bool) -> None:
+        self.order = order
+        self.live = live
+        self.moved = moved
+
+    async def lock_live_memory_ids(self, *, conn, fq_table, bank_id, unit_ids):
+        self.order.append("live")
+        return {str(unit) for unit in unit_ids} if self.live else set()
+
+    async def invalidate_memory(self, *, conn, fq_table, bank_id, unit_id, reason):
+        self.order.append("move")
+        return self.moved
+
+
+class _FakeEngine:
+    def __init__(self, order: list[str]) -> None:
+        self.order = order
+
+    async def sweep_invalidation_dependents(self, conn, bank_id: str, fact_ids: list[str]) -> None:
+        self.order.append("sweep")
+
+
+def _recorded_sequence_patches(order: list[str]) -> ExitStack:
+    """Record the graph-maintenance enqueues the step owes, in the order they run."""
+
+    async def relink(conn, bank_id: str, unit_ids: list[str]) -> int:
+        order.append("relink")
+        return 0
+
+    async def prune(conn, bank_id: str, unit_ids: list[str]) -> int:
+        order.append("prune")
+        return 0
+
+    stack = ExitStack()
+    stack.enter_context(patch.object(graph_maintenance, "enqueue_relink_victims", new=relink))
+    stack.enter_context(patch.object(graph_maintenance, "enqueue_entity_prune_candidates", new=prune))
+    return stack
+
+
+async def _drive_invalidation(store: _FakeStore, engine: _FakeEngine, entries: list[tuple[str, str]]) -> None:
+    with ExitStack() as stack:
+        stack.enter_context(patch.object(consolidator_module, "get_memories", return_value=store))
+        stack.enter_context(_recorded_sequence_patches(store.order))
+        await _apply_invalidations_in_transaction(
+            conn=object(), bank_id="bank", entries=entries, memory_engine=engine
+        )
+
+
+@pytest.mark.asyncio
+async def test_invalidation_mirrors_the_canonical_sequence() -> None:
+    """P2: sweep, capture the relink victims and prune candidates, move, then sweep again."""
+    order: list[str] = []
+    store = _FakeStore(order, live=True, moved=True)
+    fact_id = str(uuid.uuid4())
+
+    await _drive_invalidation(store, _FakeEngine(order), [(fact_id, "superseded")])
+
+    assert order == ["live", "sweep", "relink", "prune", "move", "sweep"], (
+        "the canonical invalidate sequence: the captures run before the row (and its links "
+        "and postings) go, and the second sweep catches a racing observation insert"
+    )
+
+
+@pytest.mark.asyncio
+async def test_invalidation_skips_an_absent_live_row() -> None:
+    """P6/P2: an absent row is a skip with no sweep and no enqueue (absence is read first)."""
+    order: list[str] = []
+    store = _FakeStore(order, live=False, moved=False)
+
+    await _drive_invalidation(store, _FakeEngine(order), [(str(uuid.uuid4()), "superseded")])
+
+    assert order == ["live"], "the row is gone: no sweep, no enqueue, no move"
+
+
+@pytest.mark.asyncio
+async def test_invalidation_writer_false_skips_the_post_move_sweep() -> None:
+    """P5: a writer that found no row to move does not get the post-move sweep.
+
+    Through the SQL store this cannot happen — the share-locked liveness read settles the
+    absence before the sweep — so a store whose liveness read and write disagree is the only
+    way to reach the guard. It still must not sweep after a move that did not happen.
+    """
+    order: list[str] = []
+    store = _FakeStore(order, live=True, moved=False)
+
+    await _drive_invalidation(store, _FakeEngine(order), [(str(uuid.uuid4()), "superseded")])
+
+    assert order == ["live", "sweep", "relink", "prune", "move"], "no second sweep after an unmoved row"
 
 
 # ── the batch's all-or-nothing rule, on a real database ────────────────────────
@@ -305,7 +469,10 @@ async def test_invalidation_applies_through_the_store_and_records_the_reason(mem
     assert result["memories_failed"] == 0, "an applied invalidation is a judgment, not a failed batch"
     assert live == 0, "the judged fact is archived, out of every recall surface"
     assert archived == "superseded by a later decision", "the writer records the model's own reason"
-    assert sweeps == [[str(fact_id)]], "the archived fact's dependents are swept in the same transaction"
+    assert sweeps == [[str(fact_id)], [str(fact_id)]], (
+        "the archived fact's dependents are swept before the move and again after it, "
+        "both inside the same transaction"
+    )
 
 
 class _TransactionCancelledOnExit:
@@ -379,3 +546,55 @@ async def test_cancellation_during_invalidation_rollback_escapes(memory: MemoryE
             )
     finally:
         await memory.delete_bank(bank_id, request_context=request_context)
+
+
+@pytest.mark.asyncio
+@pytest.mark.memory_backend_incompatible
+async def test_a_failing_sweep_rolls_the_archive_move_back(memory: MemoryEngine, request_context):
+    """P2/P5: the sweep after the move shares the move's transaction, so its failure rolls back.
+
+    ``_apply_invalidations_in_transaction`` is the only production path for an invalidation;
+    an exception from its sweep must escape into the batch transaction, not be turned into a
+    completed batch. The move, its change record and the stamps roll back with it, and the
+    fact stays live and pending for the next round.
+    """
+    bank_id = f"inval-sweep-{uuid.uuid4().hex[:8]}"
+    await memory.ensure_bank_profile(bank_id=bank_id, request_context=request_context)
+    sweeps: list[list[str]] = []
+
+    async def fail_on_the_second_sweep(conn, bank_id: str, fact_ids: list[str]) -> None:
+        sweeps.append([str(fact) for fact in fact_ids])
+        if len(sweeps) == 2:
+            raise RuntimeError("dependent sweep failed")
+
+    try:
+        async with memory._pool.acquire() as conn:
+            fact_id = await _insert_fact(conn, bank_id, "Alice lives in Berlin", ["user:alice"])
+
+        async def judged_answer(**kwargs):
+            return _BatchLLMResult(invalidations=[_Invalidation(fact_id=str(fact_id), reason="superseded")])
+
+        result = await _run_job(
+            memory,
+            bank_id,
+            request_context,
+            lambda messages, scope: _FactBatchResponse(),
+            patch.object(consolidator_module, "_consolidate_batch_with_llm", new=judged_answer),
+            patch.object(memory, "sweep_invalidation_dependents", new=fail_on_the_second_sweep),
+        )
+
+        async with memory._pool.acquire() as conn:
+            live = await conn.fetchval("SELECT count(*) FROM memory_units WHERE id = $1", fact_id)
+            archived = await conn.fetchval(
+                "SELECT count(*) FROM invalidated_memory_units WHERE id = $1", fact_id
+            )
+            stamped = await conn.fetchval("SELECT consolidated_at FROM memory_units WHERE id = $1", fact_id)
+    finally:
+        await memory.delete_bank(bank_id, request_context=request_context)
+
+    assert sweeps == [[str(fact_id)], [str(fact_id)]], "the dependent sweep runs before and after the move"
+    assert result["status"] == "completed"
+    assert result["memories_failed"] == 1, "a failed invalidation step is a failed batch, not a completion"
+    assert live == 1, "the archive move rolled back with the sweep that failed after it"
+    assert archived == 0, "nothing reached the archive"
+    assert stamped is None, "a failed batch does not stamp its fact as consolidated"

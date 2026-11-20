@@ -135,7 +135,7 @@ A lasting fact must end up somewhere: an existing observation it repeats, change
 
 `deletes` (rare): only when two EXISTING observations say exactly the same thing — delete one by its `observation_id`, with `merged_into` set to the other: `"deletes": [{{"observation_id": "O7", "merged_into": "O2"}}]`. Never delete because something changed or ended.
 
-`invalidations` (rare): when a fact in THIS batch shows that an earlier raw fact in the same batch is outdated, name that earlier fact here — one entry per outdated fact: `{{"fact_id": "F3", "reason": "one sentence saying why this fact is outdated"}}`. Emit an entry only when you judge that fact outdated; when no fact is outdated, leave `"invalidations": []`. Only raw facts from this batch can be invalidated — never an observation, never a mental model, never a fact outside the batch. The `reason` is your own explanation recorded with the archive; it is not used to decide which fact is current."""
+`invalidations` (rare): when a fact in THIS batch shows that an earlier raw fact in the same batch is WRONG — it said something that was never true, or a later fact shows what it said to be false — name that earlier fact here, one entry per wrong fact: `{{"fact_id": "F3", "reason": "one sentence saying why this fact is wrong"}}`. Emit an entry only when you judge that fact wrong; when no fact is wrong, leave `"invalidations": []`. A fact that was true when it was stated and is only superseded by a later state is NOT wrong: the TIME rule keeps it as the earlier state, so it stays recorded and you do not invalidate it. Only raw facts from this batch can be invalidated — never an observation, never a mental model, never a fact outside the batch. The `reason` is your own explanation recorded with the archive; it is not used to decide which fact is current."""
 
 # Facts are handed over in processing order, which is not the order things happened: imports and
 # backfills deliver old conversations late. Small models read the batch as the latest news and let
@@ -147,7 +147,7 @@ Facts are NOT given in the order they happened: old conversations are imported l
 
 The comparison is done for you: in a fact's `closest existing observations`, the ones stated after that fact are marked `(stated after this fact)`, and an observation stated after every new fact carries `"newer_than_input_facts": true` — both mean the fact is older news for it. Among a fact's closest observations, unmarked means the fact is the more recent.
 
-The new facts are listed oldest first. When two new facts disagree about the same thing, the LATER one in the list is current: the earlier one's `new` sentence says it as the earlier state ("Before 21 October 2026, small overages were not waived."), never as the current rule. An older fact is still recorded, as the earlier state — never dropped."""
+The new facts are listed oldest first. When two new facts disagree about the same thing, the LATER one in the list is current: the earlier one's `new` sentence says it as the earlier state ("Before 21 October 2026, small overages were not waived."), never as the current rule. An older fact is still recorded, as the earlier state — never dropped, and not invalidated merely for being superseded: an `invalidation` names only a fact this batch shows to be wrong."""
 
 _OUTPUT_SECTION = """## OUTPUT FORMAT
 
