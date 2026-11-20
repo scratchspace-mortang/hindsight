@@ -3271,15 +3271,16 @@ async def _process_memory_batch(
         perf.record_llm_batch_failures(llm_result.failed_attempts)
     honored_skips = _settle_skips(llm_result)
     # C5: only source facts in this batch and of a curatable type are eligible. The
-    # model emitted the whole judgment; the service applies it without deciding
-    # which conflicting fact is current (R8, R11). Each reason travels with its id.
+    # eligible set is the one the prompt showed — ``llm_memories``, with triage-settled
+    # facts already removed — so a settled fact's id can only be a hallucination and
+    # must not archive a fact the model never saw. The model emitted the whole judgment;
+    # the service applies it without deciding which conflicting fact is current (R8, R11).
+    # Each reason travels with its id.
     invalidation_entries = (
         filter_invalidations(
             [(inv.fact_id, inv.reason) for inv in llm_result.invalidations],
-            batch_fact_ids={str(m["id"]) for m in memories},
-            curatable_ids={
-                str(m["id"]) for m in memories if m.get("fact_type") in ("world", "experience")
-            },
+            batch_fact_ids={str(m["id"]) for m in llm_memories},
+            curatable_ids={str(m["id"]) for m in llm_memories if m.get("fact_type") in ("world", "experience")},
         )
         if not llm_result.failed
         else []
@@ -3306,6 +3307,9 @@ async def _process_memory_batch(
     # verdict adjudicated) with no connection held, and only then written.
     per_memory_created: set[str] = set()
     per_memory_updated: set[str] = set()
+    #: Facts this response archived as invalid. Its own result, so the caller's
+    #: "unaddressed" re-ask never mistakes a judgment for an oversight (C2).
+    invalidated_ids: set[str] = set()
 
     mem_by_id = {str(m["id"]): m for m in memories}
 
@@ -3690,6 +3694,28 @@ async def _process_memory_batch(
                     for merged in merged_away:
                         await _fold_deleted_evidence(conn, memory_engine, bank_id, merged.gone, merged.target_id)
 
+                    # The facts this response consumed are marked consolidated in the SAME transaction
+                    # as the observations that now carry them. Stamping them separately is what let a
+                    # half-applied batch orphan its sources forever: the pending-consolidation predicate
+                    # excludes a stamped fact, so nothing would ever rebuild what the batch failed to
+                    # write (#3876).
+                    #
+                    # Stamped BEFORE the invalidation step, so that step's own bookkeeping lands last:
+                    # its sweep requeues the archived observation's surviving co-sources with
+                    # ``consolidated_at = NULL`` so the next round rebuilds the observation from them.
+                    # A stamp written after the sweep would cancel that requeue for any co-source that
+                    # is also in this batch (C7): the observation stays deleted and the survivor's
+                    # contribution is never rebuilt.
+                    if stamp_ids:
+                        await get_memories().mark_consolidated(
+                            conn=conn,
+                            fq_table=fq_table,
+                            bank_id=bank_id,
+                            unit_ids=[str(mem_id) for mem_id in stamp_ids],
+                            when=datetime.now(timezone.utc),
+                            failed=False,
+                        )
+
                     # C6: invalidate model-judged facts inside this open transaction, before
                     # commit, so the archive moves and the dependent-observation sweeps commit
                     # or roll back with the rest of the response (R9, DST5, DST8).
@@ -3710,21 +3736,8 @@ async def _process_memory_batch(
                                 exc_info=True,
                             )
                             raise
+                        invalidated_ids = {fact_id for fact_id, _ in invalidation_entries}
 
-                    # The facts this response consumed are marked consolidated in the SAME transaction
-                    # as the observations that now carry them. Stamping them separately is what let a
-                    # half-applied batch orphan its sources forever: the pending-consolidation predicate
-                    # excludes a stamped fact, so nothing would ever rebuild what the batch failed to
-                    # write (#3876).
-                    if stamp_ids:
-                        await get_memories().mark_consolidated(
-                            conn=conn,
-                            fq_table=fq_table,
-                            bank_id=bank_id,
-                            unit_ids=[str(mem_id) for mem_id in stamp_ids],
-                            when=datetime.now(timezone.utc),
-                            failed=False,
-                        )
                     await write_batch.commit()
         except BaseException as exc:
             await write_batch.abort()
@@ -3749,6 +3762,12 @@ async def _process_memory_batch(
             results.append({"action": "created"})
         elif updated:
             results.append({"action": "updated"})
+        elif mid in invalidated_ids:
+            # C2: the model archived this fact on its own judgment. Reporting it as
+            # ``no_durable_knowledge`` would make the caller read a judgment as an
+            # oversight, re-ask a dead fact up to two more times, and count a judged
+            # fact as unaddressed in the stats.
+            results.append({"action": "invalidated"})
         elif mid in triage.chatter:
             results.append({"action": "skipped", "reason": "triage_chatter"})
         elif mid in honored_skips:
@@ -4420,8 +4439,9 @@ async def _call_with_one_reask(
         logger.warning(f"[CONSOLIDATION] reply did not match the schema, asking again with the errors:\n{errors}")
         correction = (
             f"Your previous answer was discarded because it did not match the schema:\n{errors}\n"
-            'Answer again with the same decisions as ONE JSON object, {"facts": [...], "deletes": [...]}, '
-            "following the schema. Not a list, and nothing after the object."
+            "Answer again with the same decisions as ONE JSON object, "
+            '{"facts": [...], "deletes": [...], "invalidations": [...]}, following the schema. '
+            "Not a list, and nothing after the object."
         )
         messages = reask_messages(call_kwargs["messages"], first, correction)
         return (await llm_config.call(**call_kwargs | {"messages": messages})).content

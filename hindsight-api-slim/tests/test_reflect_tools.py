@@ -140,7 +140,9 @@ async def test_tool_search_mental_models_exact_empty_scope_selects_global_models
     assert fetch_call is not None
     query, *args = fetch_call.args
     assert "(tags IS NULL OR tags = '{}')" in re.sub(r"\s+", " ", query).strip()
-    assert args == ["test-global-mental-model-scope", "[0.1, 0.2]", 5]
+    # The third parameter is the SQL LIMIT: three candidates per requested result, so the
+    # stale-graph drop leaves room for a fresh page ranked below the requested top-k.
+    assert args == ["test-global-mental-model-scope", "[0.1, 0.2]", 15]
     assert result["mental_models"] == []
 
 

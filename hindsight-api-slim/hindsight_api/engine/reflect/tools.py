@@ -40,6 +40,15 @@ logger = logging.getLogger(__name__)
 #: ``reflect_default_options.reflect_search_mental_models_max_tokens``.
 DEFAULT_MENTAL_MODELS_SEARCH_MAX_TOKENS = 16000
 
+#: Candidates fetched per requested mental-model result. The graph-staleness drop in
+#: :func:`tool_search_mental_models` is a predicate over a fetched row, not one the ranking
+#: query can apply: the verdict comes from the owner's per-model staleness computation, after
+#: the fetch. Fetching exactly ``max_results`` therefore lets stale graph pages take every
+#: slot from fresh pages ranked below them, and the search returns fewer results than the bank
+#: holds. Over-fetching still bounds one search while leaving room for the drop; the result is
+#: truncated back to ``max_results`` once the stale pages are gone.
+_MENTAL_MODELS_SEARCH_OVERFETCH = 3
+
 #: The budget a mental-model refresh searches pages with: the best page whole, the rest
 #: snippets. At the reflect default, test_refresh_pages_benchmark_cost's refreshes (sibling pages
 #: included) cost ~50% more input (79k -> 120k full, 69k -> 100k delta), mostly sibling
@@ -171,7 +180,12 @@ async def tool_search_mental_models(
 
     # Build filters dynamically
     filters = ""
-    params: list[Any] = [bank_id, str(query_embedding), max_results]
+    # Fetch more candidates than asked for: the stale-graph drop below runs after the
+    # ranking, so exactly ``max_results`` candidates would let stale pages take every slot
+    # from fresh pages ranked under them. Both ranking paths take this bound, and the
+    # result is truncated to ``max_results`` once the drop has run.
+    candidate_limit = max_results * _MENTAL_MODELS_SEARCH_OVERFETCH
+    params: list[Any] = [bank_id, str(query_embedding), candidate_limit]
     next_param = 4
 
     # Exact matching treats absent or empty tags as the global scope. Do not
@@ -203,7 +217,9 @@ async def tool_search_mental_models(
     # A store that indexes pages answers the ranking and the relevance; Postgres still hydrates the
     # rows, because the store holds only the searchable half. The tag scope and `exclude_ids` are
     # pushed down rather than applied afterwards: a hit that gets discarded here has already taken a
-    # top-k slot from a page that would have qualified.
+    # top-k slot from a page that would have qualified. The same holds for the stale-graph drop
+    # below, which cannot be pushed down because its verdict comes after the fetch, so both paths
+    # rank ``candidate_limit`` rows instead of ``max_results``.
     from ..memories import get_memories
 
     store = get_memories()
@@ -211,7 +227,7 @@ async def tool_search_mental_models(
         matches = await store.search_pages_semantic(
             bank_id,
             embedding=list(query_embedding),
-            limit=max_results,
+            limit=candidate_limit,
             tags=tags,
             tags_match=tags_match,
             tag_groups=tag_groups,
@@ -327,6 +343,12 @@ async def tool_search_mental_models(
                 "staleness_reason": staleness_reason,
             }
         )
+
+    # The over-fetch above only existed to survive the stale-graph drop; the caller asked
+    # for at most ``max_results`` pages. Packing ran in rank order, so the first
+    # ``max_results`` here carry exactly the whole/snippet decision they would have had
+    # without the extra candidates.
+    mental_models = mental_models[:max_results]
 
     return {
         "query": query,

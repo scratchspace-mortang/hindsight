@@ -17,6 +17,8 @@ import asyncio
 import json
 import uuid
 from contextlib import ExitStack, asynccontextmanager
+from types import SimpleNamespace
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -598,3 +600,244 @@ async def test_a_failing_sweep_rolls_the_archive_move_back(memory: MemoryEngine,
     assert live == 1, "the archive move rolled back with the sweep that failed after it"
     assert archived == 0, "nothing reached the archive"
     assert stamped is None, "a failed batch does not stamp its fact as consolidated"
+
+
+# ── C1: the schema-correction re-ask must not drop the judgment ───────────────
+
+
+class _ScriptedLLM:
+    """A model double: scripted replies, recording every request it is sent."""
+
+    def __init__(self, replies: list[Any]) -> None:
+        self.replies = list(replies)
+        self.requests: list[dict[str, Any]] = []
+
+    async def call(self, **kwargs: Any) -> SimpleNamespace:
+        self.requests.append(kwargs)
+        return SimpleNamespace(content=self.replies.pop(0))
+
+
+@pytest.mark.asyncio
+async def test_schema_correction_names_the_invalidations_field() -> None:
+    """C1: a re-answer is taught every top-level field, or the judgment is lost.
+
+    A reply whose top-level shape is wrong (a list instead of an object) gets one
+    re-ask carrying the errors. The correction used to name only ``facts`` and
+    ``deletes``: a re-answer taught that object omits ``invalidations``, the field
+    defaults to ``[]``, validation passes, and the batch stamps the facts while the
+    model's judgment is silently discarded.
+    """
+    llm = _ScriptedLLM([[{"facts": []}], _FactBatchResponse()])
+    call_kwargs = {
+        "messages": [
+            {"role": "system", "content": "consolidate these facts"},
+            {"role": "user", "content": "the facts"},
+        ],
+        "response_format": _FactBatchResponse,
+    }
+
+    answer = await consolidator_module._call_with_one_reask(llm, call_kwargs, _FactBatchResponse)
+
+    assert isinstance(answer, _FactBatchResponse), "the second reply is returned as the answer"
+    assert len(llm.requests) == 2, "exactly one re-ask after a rejected top-level shape"
+    correction = llm.requests[1]["messages"][-1]["content"]
+    assert "invalidations" in correction, "the correction must name the field an object re-answer must carry"
+    assert "Not a list" in correction, "the shape instruction survives"
+
+
+# ── C2: an invalidated fact is a judgment, not an unaddressed fact ────────────
+
+
+@pytest.mark.asyncio
+@pytest.mark.memory_backend_incompatible
+async def test_invalidated_fact_is_not_reasked_as_unaddressed(memory: MemoryEngine, request_context):
+    """C2: the archived fact must leave the re-ask loop and the skipped count.
+
+    A fact the same response invalidated is absent from the created/updated sets and
+    from the model's own skips, so the per-memory result used to call it
+    ``no_durable_knowledge``. The caller reads that as an oversight and asks it again,
+    up to two more times; the re-ask's creates are dropped as non-live, so the dead
+    fact burns recall+embed+LLM while the stats report it as never addressed.
+    """
+    bank_id = f"inval-reask-{uuid.uuid4().hex[:8]}"
+    await memory.ensure_bank_profile(bank_id=bank_id, request_context=request_context)
+    calls: list[str] = []
+    invalidated: uuid.UUID | None = None
+    skipped: uuid.UUID | None = None
+
+    def answer(messages, scope):
+        if scope == "consolidation":
+            calls.append("\n".join(str(message.get("content")) for message in messages))
+        return _FactBatchResponse(
+            facts=[{"fact_id": str(skipped), "kind": "momentary"}],
+            invalidations=[{"fact_id": str(invalidated), "reason": "contradicted by a later fact"}],
+        )
+
+    try:
+        async with memory._pool.acquire() as conn:
+            invalidated = await _insert_fact(conn, bank_id, "Alice lives in Berlin", ["user:alice"])
+            skipped = await _insert_fact(conn, bank_id, "The cat sat on the mat", ["user:alice"])
+
+        result = await _run_job(memory, bank_id, request_context, answer)
+
+        async with memory._pool.acquire() as conn:
+            archived = await conn.fetchval("SELECT count(*) FROM invalidated_memory_units WHERE id = $1", invalidated)
+            skipped_live = await conn.fetchval("SELECT count(*) FROM memory_units WHERE id = $1", skipped)
+            skipped_stamped = await conn.fetchval("SELECT consolidated_at FROM memory_units WHERE id = $1", skipped)
+    finally:
+        await memory.delete_bank(bank_id, request_context=request_context)
+
+    assert result["status"] == "completed"
+    assert len(calls) == 1, (
+        "a model-judged invalidation is a judgment, not an unaddressed fact: it must not be re-asked"
+        + (f"\nsecond consolidation request:\n{calls[1]}" if len(calls) > 1 else "")
+    )
+    assert result["memories_processed"] == 2, "each fact of the batch is processed once"
+    assert result["skipped"] == 1, "only the model's own skip counts as skipped; the archived fact was judged"
+    assert archived == 1, "the judged fact is archived"
+    assert skipped_live == 1, "the model's skip settles its own fact"
+    assert skipped_stamped is not None, "a settled fact is stamped consolidated"
+
+
+# ── C4: eligibility is the set the model was shown, not the whole batch ───────
+
+
+@pytest.mark.asyncio
+@pytest.mark.memory_backend_incompatible
+async def test_triage_settled_fact_cannot_be_invalidated(memory: MemoryEngine, request_context):
+    """C4: a triage-settled fact was never in the prompt, so its id cannot be eligible.
+
+    ``llm_memories`` removes triage-settled facts before the call. The eligibility
+    filter used the whole ``memories`` batch instead, so a hallucinated id of a
+    settled fact passed and the batch archived a fact the model never saw, on a
+    judgment it never made.
+    """
+    from hindsight_api.engine.consolidation.triage import TriageResult
+
+    bank_id = f"inval-triage-{uuid.uuid4().hex[:8]}"
+    await memory.ensure_bank_profile(bank_id=bank_id, request_context=request_context)
+    prompts: list[str] = []
+    triaged: uuid.UUID | None = None
+    shown: uuid.UUID | None = None
+
+    async def settle(*args, **kwargs):
+        return TriageResult(chatter={str(triaged)})
+
+    def answer(messages, scope):
+        if scope == "consolidation":
+            prompts.append("\n".join(str(message.get("content")) for message in messages))
+        return _FactBatchResponse(
+            facts=[{"fact_id": str(shown), "kind": "momentary"}],
+            invalidations=[{"fact_id": str(triaged), "reason": "hallucinated id of a settled fact"}],
+        )
+
+    try:
+        async with memory._pool.acquire() as conn:
+            triaged = await _insert_fact(conn, bank_id, "Triage settled this fact", ["user:alice"])
+            shown = await _insert_fact(conn, bank_id, "This fact was shown to the model", ["user:alice"])
+
+        await _run_job(
+            memory,
+            bank_id,
+            request_context,
+            answer,
+            patch.object(consolidator_module, "triage_model", new=lambda config: object()),
+            patch.object(consolidator_module, "triage_facts", new=settle),
+        )
+
+        async with memory._pool.acquire() as conn:
+            triaged_live = await conn.fetchval("SELECT count(*) FROM memory_units WHERE id = $1", triaged)
+            triaged_archived = await conn.fetchval(
+                "SELECT count(*) FROM invalidated_memory_units WHERE id = $1", triaged
+            )
+            shown_stamped = await conn.fetchval("SELECT consolidated_at FROM memory_units WHERE id = $1", shown)
+    finally:
+        await memory.delete_bank(bank_id, request_context=request_context)
+
+    assert prompts, "the fact the model was shown must still reach the LLM"
+    assert "Triage settled this fact" not in prompts[0], "the settled fact was never in the prompt"
+    assert triaged_live == 1, "a fact the model never saw cannot be archived on its judgment"
+    assert triaged_archived == 0, "nothing reached the archive"
+    assert shown_stamped is not None, "the shown fact is settled by its own skip"
+
+
+# ── C7: the stamp must not overwrite the sweep's requeue of a co-source ───────
+
+
+@pytest.mark.asyncio
+@pytest.mark.memory_backend_incompatible
+async def test_in_batch_skipped_co_source_stays_pending_after_invalidation(memory: MemoryEngine, request_context):
+    """C7: invalidated A and skipped B share one observation; the next round rebuilds it from B.
+
+    The invalidation step sweeps the archived observation's dependents, and that sweep
+    resets ``consolidated_at`` on the observation's surviving co-sources so the next
+    round rebuilds it from them. The batch stamped every sub-batch id *after* that sweep,
+    so an in-batch co-source B was requeued and immediately stamped: the next fetch saw
+    nothing pending, the observation was never rebuilt, and B's contribution was lost.
+    """
+    bank_id = f"inval-stamp-{uuid.uuid4().hex[:8]}"
+    await memory.ensure_bank_profile(bank_id=bank_id, request_context=request_context)
+    archived_fact: uuid.UUID | None = None
+    skipped_fact: uuid.UUID | None = None
+    observation: uuid.UUID | None = None
+    requests: list[str] = []
+    replies = [
+        # Round 1: the model judges A wrong and settles B as chatter. Both share one observation.
+        lambda: _FactBatchResponse(
+            facts=[{"fact_id": str(skipped_fact), "kind": "momentary"}],
+            invalidations=[{"fact_id": str(archived_fact), "reason": "contradicted by a later fact"}],
+        ),
+        # Round 2: the requeued survivor, consolidated again, rebuilds its observation.
+        lambda: _FactBatchResponse(
+            facts=[
+                {
+                    "fact_id": str(skipped_fact),
+                    "kind": "durable",
+                    "about": "Alice's home",
+                    "adds": "yes",
+                    "new": ["Alice lives in Potsdam"],
+                }
+            ]
+        ),
+    ]
+
+    def answer(messages, scope):
+        if scope == "consolidation":
+            requests.append("\n".join(str(message.get("content")) for message in messages))
+        return replies.pop(0)() if replies else _FactBatchResponse()
+
+    try:
+        async with memory._pool.acquire() as conn:
+            archived_fact = await _insert_fact(conn, bank_id, "Alice lives in Berlin", ["user:alice"])
+            skipped_fact = await _insert_fact(conn, bank_id, "Alice lives in Potsdam", ["user:alice"])
+            observation = uuid.uuid4()
+            await conn.execute(
+                "INSERT INTO memory_units(id, bank_id, text, fact_type, source_memory_ids) "
+                "VALUES($1,$2,'Alice lives in Berlin. Alice lives in Potsdam.','observation',$3)",
+                observation,
+                bank_id,
+                [archived_fact, skipped_fact],
+            )
+
+        result = await _run_job(memory, bank_id, request_context, answer)
+
+        async with memory._pool.acquire() as conn:
+            archived = await conn.fetchval("SELECT count(*) FROM invalidated_memory_units WHERE id = $1", archived_fact)
+            original_left = await conn.fetchval("SELECT count(*) FROM memory_units WHERE id = $1", observation)
+            rebuilt = await conn.fetchrow(
+                "SELECT text, source_memory_ids FROM memory_units WHERE bank_id = $1 AND fact_type = 'observation'",
+                bank_id,
+            )
+            stamped = await conn.fetchval("SELECT consolidated_at FROM memory_units WHERE id = $1", skipped_fact)
+    finally:
+        await memory.delete_bank(bank_id, request_context=request_context)
+
+    assert result["status"] == "completed"
+    assert archived == 1, "the judged fact is archived"
+    assert original_left == 0, "the sweep drops the observation built on the archived fact"
+    assert len(requests) == 2, "the requeued survivor is fetched again in the same job, as the next round"
+    assert "Alice lives in Potsdam" in requests[1], "the next round consolidates the survivor B"
+    assert rebuilt is not None, "the next round rebuilds the observation from the surviving co-source"
+    assert rebuilt["text"] == "Alice lives in Potsdam", "the rebuild carries B's knowledge, not the old text"
+    assert list(rebuilt["source_memory_ids"]) == [skipped_fact], "the rebuilt observation stands on B alone"
+    assert stamped is not None, "B is stamped only after the round that rebuilt it"
