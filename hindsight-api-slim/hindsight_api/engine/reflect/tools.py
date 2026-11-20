@@ -166,7 +166,7 @@ async def tool_search_mental_models(
     Returns:
         Dict with matching mental models including content and freshness info
     """
-    from ..memory_engine import _mental_model_stale_scope_from_row, _page_snippet
+    from ..memory_engine import _graph_staleness_settings, _mental_model_stale_scope_from_row, _page_snippet
     from ..search.tags import build_tag_groups_where_clause, build_tags_where_clause
 
     # Build filters dynamically
@@ -274,6 +274,15 @@ async def tool_search_mental_models(
             last_refreshed_at = last_refreshed_at.replace(tzinfo=timezone.utc)
 
         is_stale = staleness[str(row["id"])]
+        # R1/R2/D2/D8/C1: never offer a graph-mode stale page to the model, neither
+        # whole nor as a snippet. The computed staleness already respects graph mode
+        # (A1), so reuse the owner's trigger parser for the mode rather than run a
+        # second staleness query or a divergent parser. Dropping here also keeps the
+        # page from spending the whole-page token budget; tagscope and fresh pages
+        # fall through unchanged, keeping their stale label and lower-layer retrieval.
+        staleness_check, _ = _graph_staleness_settings(row["trigger"])
+        if staleness_check == "graph" and is_stale:
+            continue
         staleness_reason = "new in-scope memories ingested since last refresh" if is_stale else None
 
         content = row["content"] or ""
