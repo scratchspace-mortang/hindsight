@@ -2515,6 +2515,14 @@ async def _run_consolidation_job(
                 sub_deleted: int = 0
                 sub_llm_failed = False
                 sub_ids = [m["id"] for m in sub_batch]
+                # Co-sources this sub-batch's earlier passes requeued (``consolidated_at`` reset
+                # to NULL) when an invalidation sweep deleted a shared observation. Those ids must
+                # stay out of the final pass's stamp: it commits in a later transaction, after the
+                # sweep, so stamping one would cancel the requeue and the deleted observation would
+                # never be rebuilt from the survivor (C7 across passes). A requeue the final pass
+                # makes itself needs no exclusion — there the stamp runs first and the sweep lands
+                # last, inside one transaction.
+                requeued_co_sources: set[str] = set()
                 if obs_tags_list:
                     sub_results: list[dict[str, Any]] = []
                     for pass_index, obs_tags in enumerate(obs_tags_list):
@@ -2522,6 +2530,7 @@ async def _run_consolidation_job(
                         # scope; the ``consolidated_at`` stamp belongs to the last of them, so
                         # an earlier scope's write and the stamp never commit apart (#3876).
                         is_final_pass = pass_index == len(obs_tags_list) - 1
+                        pass_requeued: list[str] = []
                         pass_results, pass_deleted, pass_failed = await _process_memory_batch(
                             # Optional on the caller only because the engine clears its backend on close.
                             pool=cast("DatabaseBackend", pool),
@@ -2533,7 +2542,12 @@ async def _run_consolidation_job(
                             perf=batch_perf,
                             config=config,
                             obs_tags_override=obs_tags,
-                            mark_consolidated_ids=sub_ids if is_final_pass else None,
+                            mark_consolidated_ids=(
+                                [mid for mid in sub_ids if str(mid) not in requeued_co_sources]
+                                if is_final_pass
+                                else None
+                            ),
+                            requeued_co_source_ids=pass_requeued,
                             fold_substitutions=fold_substitutions,
                         )
                         sub_deleted += pass_deleted
@@ -2543,6 +2557,9 @@ async def _run_consolidation_job(
                             # committed. Running the rest would only add writes to discard.
                             sub_llm_failed = True
                             break
+                        # A pass that committed its sweep requeued these; a pass that failed
+                        # committed no invalidation, so its list is empty.
+                        requeued_co_sources.update(pass_requeued)
                         if not sub_results:
                             sub_results = pass_results
                         else:
@@ -3134,6 +3151,7 @@ async def _process_memory_batch(
     obs_tags_override: list[str] | None = None,
     mark_consolidated_ids: list[Any] | None = None,
     fold_substitutions: dict[str, str] | None = None,
+    requeued_co_source_ids: list[str] | None = None,
 ) -> tuple[list[dict[str, Any]], int, bool]:
     """
     Process a batch of memories in a single LLM call.
@@ -3158,6 +3176,11 @@ async def _process_memory_batch(
             batch's write transaction, so the stamps share the fate of the observations
             derived from the same LLM response (#3876). None on a pass that is not the
             final one for these memories — the caller stamps once, on the last pass.
+        requeued_co_source_ids: Out-parameter for the caller: the co-source ids this pass's
+            invalidation sweeps reset to unconsolidated. A caller that stamps on a later
+            pass must keep them out of that stamp, or the stamp cancels the requeue and the
+            observation the sweep deleted is never rebuilt from its surviving co-source
+            (C7 across passes).
     """
     # Map the source memories this batch consumes onto the consolidation trace.
     record_source_memory_ids([str(m["id"]) for m in memories])
@@ -3539,6 +3562,9 @@ async def _process_memory_batch(
 
     # --- Apply: one transaction for everything this LLM response decided ------
     deleted_count = 0
+    # The co-sources this pass's invalidation sweeps requeue, reported back through
+    # ``requeued_co_source_ids`` (see the multi-scope pass loop for why a later pass cares).
+    requeued_co_sources: set[str] = set()
     # A failed LLM call yields no actions, and its memories must NOT be stamped: the caller
     # bisects and retries them, and a stamp would exclude them from pending consolidation
     # for good. With neither writes nor stamps there is nothing to open a transaction for.
@@ -3570,16 +3596,23 @@ async def _process_memory_batch(
                     # takes no row lock — so the write set is still locked before any other
                     # lock.
                     if invalidation_entries:
-                        touched += [
-                            observation.unit_id
-                            for observation in await get_memories().observations_for_sources(
-                                conn=conn,
-                                ops=memory_engine._backend.ops,
-                                fq_table=fq_table,
-                                bank_id=bank_id,
-                                unit_ids=[fact_id for fact_id, _ in invalidation_entries],
-                            )
-                        ]
+                        affected_observations = await get_memories().observations_for_sources(
+                            conn=conn,
+                            ops=memory_engine._backend.ops,
+                            fq_table=fq_table,
+                            bank_id=bank_id,
+                            unit_ids=[fact_id for fact_id, _ in invalidation_entries],
+                        )
+                        touched += [observation.unit_id for observation in affected_observations]
+                        # The sweeps below delete every one of these observations and reset
+                        # ``consolidated_at`` on their surviving sources. Report those survivors: a
+                        # caller that stamps on a later pass must leave them out of that stamp, or
+                        # the stamp lands after this sweep and cancels the requeue (C7 across passes).
+                        requeued_co_sources = {
+                            str(source_id)
+                            for observation in affected_observations
+                            for source_id in observation.source_memory_ids
+                        } - {fact_id for fact_id, _ in invalidation_entries}
                     await get_memories().lock_consolidation_write_set(
                         conn=conn,
                         fq_table=fq_table,
@@ -3604,6 +3637,7 @@ async def _process_memory_batch(
                         )
                         prepared_deletes, prepared_updates, prepared_creates, stamp_ids = [], [], [], []
                         invalidation_entries = []
+                        requeued_co_sources = set()
 
                     # Each action below reads its sources (liveness, entities) and, for an update,
                     # the observation it rewrites — one read at a time. Naming them all first lets
@@ -3705,7 +3739,10 @@ async def _process_memory_batch(
                     # ``consolidated_at = NULL`` so the next round rebuilds the observation from them.
                     # A stamp written after the sweep would cancel that requeue for any co-source that
                     # is also in this batch (C7): the observation stays deleted and the survivor's
-                    # contribution is never rebuilt.
+                    # contribution is never rebuilt. That order holds within one pass; a later pass
+                    # of the same sub-batch stamps in a new transaction, so the caller keeps the ids
+                    # an earlier pass's sweep requeued out of ``mark_consolidated_ids`` (see the
+                    # multi-scope pass loop) rather than relying on this ordering across passes.
                     if stamp_ids:
                         await get_memories().mark_consolidated(
                             conn=conn,
@@ -3775,6 +3812,8 @@ async def _process_memory_batch(
         else:
             results.append({"action": "skipped", "reason": "no_durable_knowledge"})
 
+    if requeued_co_source_ids is not None:
+        requeued_co_source_ids.extend(sorted(requeued_co_sources))
     return results, deleted_count, llm_result.failed
 
 

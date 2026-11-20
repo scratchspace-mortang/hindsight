@@ -331,7 +331,7 @@ def _override_config(memory: MemoryEngine, **overrides):
     return patch.object(memory._config_resolver, "resolve_full_config", return_value=fake)
 
 
-async def _insert_fact(conn, bank_id: str, text: str, tags: list[str]) -> uuid.UUID:
+async def _insert_fact(conn, bank_id: str, text: str, tags: list[str], observation_scopes: Any = None) -> uuid.UUID:
     mem_id = uuid.uuid4()
     await conn.execute(
         """
@@ -342,7 +342,7 @@ async def _insert_fact(conn, bank_id: str, text: str, tags: list[str]) -> uuid.U
         bank_id,
         text,
         tags,
-        json.dumps(None),
+        json.dumps(observation_scopes),
     )
     return mem_id
 
@@ -838,6 +838,112 @@ async def test_in_batch_skipped_co_source_stays_pending_after_invalidation(memor
     assert len(requests) == 2, "the requeued survivor is fetched again in the same job, as the next round"
     assert "Alice lives in Potsdam" in requests[1], "the next round consolidates the survivor B"
     assert rebuilt is not None, "the next round rebuilds the observation from the surviving co-source"
+    assert rebuilt["text"] == "Alice lives in Potsdam", "the rebuild carries B's knowledge, not the old text"
+    assert list(rebuilt["source_memory_ids"]) == [skipped_fact], "the rebuilt observation stands on B alone"
+    assert stamped is not None, "B is stamped only after the round that rebuilt it"
+
+
+# C7 across passes: an earlier scope's requeue must survive the final stamp
+
+
+@pytest.mark.asyncio
+@pytest.mark.memory_backend_incompatible
+async def test_earlier_scope_requeue_survives_the_final_pass_stamp(memory: MemoryEngine, request_context):
+    """C7 across passes: the multi-scope caller stamps A and B only on the final pass.
+
+    A memory consolidated at several tag scopes runs one pass per scope over the same
+    sub-batch, and the consolidated_at stamp lands in the last pass's transaction. When
+    the first pass invalidates A, its sweep deletes the observation A and B share and resets
+    consolidated_at on the surviving co-source B. The final pass then stamped every id in
+    the sub-batch, B included, after that sweep: the requeue was cancelled, the next fetch saw
+    nothing pending, and the observation the sweep deleted was never rebuilt from B. Re-emitting
+    the invalidation in the final pass does not rescue it - A is no longer live, so the step
+    skips without a sweep. The requeue has to land after the final stamp.
+    """
+    bank_id = f"inval-multiscope-{uuid.uuid4().hex[:8]}"
+    await memory.ensure_bank_profile(bank_id=bank_id, request_context=request_context)
+    archived_fact: uuid.UUID | None = None
+    skipped_fact: uuid.UUID | None = None
+    observation: uuid.UUID | None = None
+    requests: list[str] = []
+    replies = [
+        # Round 1, first scope: the model judges A wrong and settles B as chatter. A and B share
+        # one observation at this scope, so the sweep below requeues B.
+        lambda: _FactBatchResponse(
+            facts=[{"fact_id": str(skipped_fact), "kind": "momentary"}],
+            invalidations=[{"fact_id": str(archived_fact), "reason": "contradicted by a later fact"}],
+        ),
+        # Round 1, final scope: A is archived already, so the repeated judgment skips at the
+        # liveness read; the stamp this pass writes is what must not cancel the requeue.
+        lambda: _FactBatchResponse(
+            facts=[{"fact_id": str(skipped_fact), "kind": "momentary"}],
+            invalidations=[{"fact_id": str(archived_fact), "reason": "contradicted by a later fact"}],
+        ),
+        # Round 2, first scope: the requeued survivor rebuilds the observation there.
+        lambda: _FactBatchResponse(
+            facts=[
+                {
+                    "fact_id": str(skipped_fact),
+                    "kind": "durable",
+                    "about": "Alice's home",
+                    "adds": "yes",
+                    "new": ["Alice lives in Potsdam"],
+                }
+            ]
+        ),
+        # Round 2, final scope: B is settled again, so the rebuilt round stamps it.
+        lambda: _FactBatchResponse(facts=[{"fact_id": str(skipped_fact), "kind": "momentary"}]),
+    ]
+
+    def answer(messages, scope):
+        if scope == "consolidation":
+            requests.append("\n".join(str(message.get("content")) for message in messages))
+        return replies.pop(0)() if replies else _FactBatchResponse()
+
+    try:
+        async with memory._pool.acquire() as conn:
+            # Same tags and the per_tag scope spec on both facts: one sub-batch, one LLM call
+            # per tag, and the user:alice pass is the first of the two.
+            archived_fact = await _insert_fact(
+                conn, bank_id, "Alice lives in Berlin", ["user:alice", "session:s1"], "per_tag"
+            )
+            skipped_fact = await _insert_fact(
+                conn, bank_id, "Alice lives in Potsdam", ["user:alice", "session:s1"], "per_tag"
+            )
+            observation = uuid.uuid4()
+            await conn.execute(
+                "INSERT INTO memory_units(id, bank_id, text, fact_type, tags, source_memory_ids) "
+                "VALUES($1,$2,'Alice lives in Berlin. Alice lives in Potsdam.','observation',$3::text[],$4)",
+                observation,
+                bank_id,
+                ["user:alice"],
+                [archived_fact, skipped_fact],
+            )
+
+        result = await _run_job(memory, bank_id, request_context, answer)
+
+        async with memory._pool.acquire() as conn:
+            archived = await conn.fetchval("SELECT count(*) FROM invalidated_memory_units WHERE id = $1", archived_fact)
+            original_left = await conn.fetchval("SELECT count(*) FROM memory_units WHERE id = $1", observation)
+            rebuilt = await conn.fetchrow(
+                "SELECT text, source_memory_ids FROM memory_units "
+                "WHERE bank_id = $1 AND fact_type = 'observation' AND tags @> $2::varchar[]",
+                bank_id,
+                ["user:alice"],
+            )
+            stamped = await conn.fetchval("SELECT consolidated_at FROM memory_units WHERE id = $1", skipped_fact)
+    finally:
+        await memory.delete_bank(bank_id, request_context=request_context)
+
+    assert result["status"] == "completed"
+    assert archived == 1, "the judged fact is archived"
+    assert original_left == 0, "the earlier scope's sweep drops the shared observation"
+    assert len(requests) == 4, (
+        "the earlier scope's requeue is fetched again after the final pass; the final stamp "
+        "cancelled it, so the deleted observation never came back"
+    )
+    assert "Alice lives in Potsdam" in requests[2], "the next round consolidates the survivor at the earlier scope"
+    assert rebuilt is not None, "the earlier scope's observation is rebuilt from the surviving co-source"
     assert rebuilt["text"] == "Alice lives in Potsdam", "the rebuild carries B's knowledge, not the old text"
     assert list(rebuilt["source_memory_ids"]) == [skipped_fact], "the rebuilt observation stands on B alone"
     assert stamped is not None, "B is stamped only after the round that rebuilt it"
